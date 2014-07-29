@@ -9,92 +9,11 @@
 #include <sys/time.h>
 #include <arpa/inet.h>
 
-/* Document-type flags */
-enum
-{
-  TEXTHTML      = 0x0001,	/* document is of type text/html */
-  RETROKF       = 0x0002,	/* retrieval was OK */
-  HEAD_ONLY     = 0x0004,	/* only send the HEAD request */
-  SEND_NOCACHE  = 0x0008,	/* send Pragma: no-cache directive */
-  ACCEPTRANGES  = 0x0010	/* Accept-ranges header was found */
-};
+#include "http_download.h"
 
-/* Universal error type -- used almost everywhere.
-   This is, of course, utter crock.  */
-typedef enum
-{
-  NOCONERROR, HOSTERR, CONSOCKERR, CONERROR,
-  CONREFUSED, NEWLOCATION, NOTENOUGHMEM, CONPORTERR,
-  BINDERR, BINDOK, LISTENERR, ACCEPTERR, ACCEPTOK,
-  CONCLOSED, FTPOK, FTPLOGINC, FTPLOGREFUSED, FTPPORTERR,
-  FTPNSFOD, FTPRETROK, FTPUNKNOWNTYPE, FTPRERR,
-  FTPREXC, FTPSRVERR, FTPRETRINT, FTPRESTFAIL,
-  URLOK, URLHTTP, URLFTP, URLFILE, URLUNKNOWN, URLBADPORT,
-  URLBADHOST, FOPENERR, FWRITEERR, HOK, HLEXC, HEOF,
-  HERR, RETROK, RECLEVELEXC, FTPACCDENIED, WRONGCODE,
-  FTPINVPASV, FTPNOPASV,
-  RETRFINISHED, READERR, TRYLIMEXC, URLBADPATTERN,
-  FILEBADFILE, RANGEERR, RETRBADPATTERN, RETNOTSUP,
-  ROBOTSOK, NOROBOTS, PROXERR, AUTHFAILED, QUOTEXC, WRITEFAILED
-} uerr_t;
-
-enum {
-  HG_OK, HG_ERROR, HG_EOF
-};
-
-enum header_get_flags { HG_NONE = 0,
-			HG_NO_CONTINUATIONS = 0x2 };
-
-
-/* Retrieval stream */
-struct rbuf
-{
-  int fd;
-  char buffer[4096];		/* the input buffer */
-  char *buffer_pos;		/* current position in the buffer */
-  size_t buffer_left;		/* number of bytes left in the buffer:
-				   buffer_left = buffer_end - buffer_pos */
-  int internal_dont_touch_this;	/* used by RBUF_READCHAR macro */
-};
-
-/* Structure containing info on a URL.  */
-struct urlinfo
-{
-  char *url;			/* Unchanged URL */
-  char *host;			/* Extracted hostname */
-  unsigned short port;
-  char *path;	/* Path, as well as dir and file
-				   (properly decoded) */
-  char *referer;		/* The source from which the request
-				   URI was obtained */
-  char *local;			/* The local filename of the URL
-				   document */
-};
-
-struct http_stat
-{
-  long len;			/* received length */
-  long contlen;			/* expected length */
-  long restval;			/* the restart value */
-  int res;			/* the result of last read */
-  char *remote_time;		/* remote time-stamp string */
-  char *error;			/* textual HTTP error */
-  int statcode;			/* status code */
-  long dltime;			/* time of the download */
-};
-
-struct http_process_range_closure {
-  long first_byte_pos;
-  long last_byte_pos;
-  long entity_length;
-};
-
-
-#define HTTP_ACCEPT "*/*"
-char *version_string = "1.5.3";
 /* Internal variables used by the timer.  */
 static long internal_secs, internal_msecs;
-
+char *agent_string = "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.153 Safari/537.36";
 
 /* Count the digits in a (long) integer.  */
 int numdigit (long a)
@@ -206,21 +125,6 @@ int iread (int fd, char *buf, int len)
   return res;
 }
 
-#define RBUF_READCHAR(rbuf, store)					\
-((rbuf)->buffer_left							\
- ? (--(rbuf)->buffer_left,						\
-    *((char *) (store)) = *(rbuf)->buffer_pos++, 1)			\
- : ((rbuf)->buffer_pos = (rbuf)->buffer,				\
-    ((((rbuf)->internal_dont_touch_this					\
-       = iread ((rbuf)->fd, (rbuf)->buffer,				\
-		sizeof ((rbuf)->buffer))) <= 0)				\
-     ? (rbuf)->internal_dont_touch_this					\
-     : ((rbuf)->buffer_left = (rbuf)->internal_dont_touch_this - 1,	\
-	*((char *) (store)) = *(rbuf)->buffer_pos++,			\
-	1))))
-
-#define FREE_MAYBE(foo) do { if (foo) free(foo); } while (0)
-
 /* Like rbuf_readchar(), only don't move the buffer position.  */
 int rbuf_peek (struct rbuf *rbuf, char *store)
 {
@@ -237,7 +141,6 @@ int rbuf_peek (struct rbuf *rbuf, char *store)
   *store = *rbuf->buffer_pos;
   return 1;
 }
-
 
 /* Get a header from read-buffer RBUF and return it in *HDR.
 
@@ -422,7 +325,7 @@ int header_strdup (const char *header, void *closure)
         printf("Malloc failed\n");
         exit(-1);
     }
-    memset(p, len, 0);
+    bzero(p, len);
     strcpy(p, header);
 
   *(char **)closure = p;
@@ -482,38 +385,6 @@ static int http_process_range (const char *hdr, void *arg)
   return 1;
 }
 
-/* HTTP/1.0 status codes from RFC1945, provided for reference.  */
-/* Successful 2xx.  */
-#define HTTP_STATUS_OK			200
-#define HTTP_STATUS_CREATED		201
-#define HTTP_STATUS_ACCEPTED		202
-#define HTTP_STATUS_NO_CONTENT		204
-#define HTTP_STATUS_PARTIAL_CONTENTS	206
-
-/* Redirection 3xx.  */
-#define HTTP_STATUS_MULTIPLE_CHOICES	300
-#define HTTP_STATUS_MOVED_PERMANENTLY	301
-#define HTTP_STATUS_MOVED_TEMPORARILY	302
-#define HTTP_STATUS_NOT_MODIFIED	304
-
-/* Client error 4xx.  */
-#define HTTP_STATUS_BAD_REQUEST		400
-#define HTTP_STATUS_UNAUTHORIZED	401
-#define HTTP_STATUS_FORBIDDEN		403
-#define HTTP_STATUS_NOT_FOUND		404
-
-/* Server errors 5xx.  */
-#define HTTP_STATUS_INTERNAL		500
-#define HTTP_STATUS_NOT_IMPLEMENTED	501
-#define HTTP_STATUS_BAD_GATEWAY		502
-#define HTTP_STATUS_UNAVAILABLE		503
-#define H_20X(x)        (((x) >= 200) && ((x) < 300))
-#define H_PARTIAL(x)    ((x) == HTTP_STATUS_PARTIAL_CONTENTS)
-#define H_REDIRECTED(x) (((x) == HTTP_STATUS_MOVED_PERMANENTLY)	\
-			 || ((x) == HTTP_STATUS_MOVED_TEMPORARILY))
-			 
-#define RBUF_FD(rbuf) ((rbuf)->fd)
-#define TEXTHTML_S "text/html"
 
 /* Reset the internal timer.  */
 void reset_timer (void)
@@ -532,18 +403,10 @@ long elapsed_time (void)
 	  + (t.tv_usec / 1000 - internal_msecs));
 }
 
-
-/* Flags for show_progress().  */
-enum spflags { SP_NONE, SP_INIT, SP_FINISH };
-
-/* The smaller value of the two.  */
-#define MINVAL(x, y) ((x) < (y) ? (x) : (y))
-
 /* Flush RBUF's buffer to WHERE.  Flush MAXSIZE bytes at most.
    Returns the number of bytes actually copied.  If the buffer is
    empty, 0 is returned.  */
-int
-rbuf_flush (struct rbuf *rbuf, char *where, int maxsize)
+int rbuf_flush (struct rbuf *rbuf, char *where, int maxsize)
 {
   if (!rbuf->buffer_left)
     return 0;
@@ -656,7 +519,6 @@ static int show_progress (long res, long expected, enum spflags flags)
   return any_output;
 }
 
-
 /* Reads the contents of file descriptor FD, until it is closed, or a
    read error occurs.  The data is read in 8K chunks, and stored to
    stream fp, which should have been open for writing.  If BUF is
@@ -767,7 +629,7 @@ static int gethttp (struct urlinfo *u, struct http_stat *hs, int *dt)
       printf("connected!\n");
       break;
     default:
-      abort ();
+      abort();
       break;
     } /* switch */
 
@@ -776,7 +638,7 @@ static int gethttp (struct urlinfo *u, struct http_stat *hs, int *dt)
   referer = NULL;
   if (ou->referer)
     {
-      referer = (char *)alloca (9 + strlen (ou->referer) + 3);
+      referer = (char *)alloca(9 + strlen (ou->referer) + 3);
       sprintf (referer, "Referer: %s\r\n", ou->referer);
     }
   if (*dt & SEND_NOCACHE)
@@ -797,8 +659,8 @@ static int gethttp (struct urlinfo *u, struct http_stat *hs, int *dt)
   else
     range = NULL;
   
-  useragent = (char *)alloca (10 + strlen (version_string));
-  sprintf (useragent, "Wget/%s", version_string);
+  useragent = (char *)alloca(strlen(agent_string) + 1);
+  sprintf (useragent, "%s", agent_string);
 
   remhost = ou->host;
   remport = ou->port;
@@ -839,6 +701,7 @@ Accept: %s\r\n\
   *dt &= ~RETROKF;
 
   /* Before reading anything, initialize the rbuf.  */
+  bzero(&rbuf, sizeof(rbuf));
   rbuf_initialize (&rbuf, sock);
 
   all_headers = NULL;
@@ -1041,8 +904,6 @@ Accept: %s\r\n\
   return RETRFINISHED;
 }
 
-#define BUF_LEN 128
-
 int main(int argc, char *argv[])
 {
     int ret;
@@ -1057,8 +918,8 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    memset(&ui, sizeof(ui), 0);
-    memset(&hs, sizeof(hs), 0);
+    bzero(&ui, sizeof(ui));
+    bzero(&hs, sizeof(hs));
     bzero(host, BUF_LEN);
     bzero(local, BUF_LEN);
     bzero(path, BUF_LEN);
