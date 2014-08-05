@@ -1,7 +1,22 @@
 #ifndef __HTTP_DOWNLOAD_H__
 #define __HTTP_DOWNLOAD_H__
 
-/* Retrieval stream */
+#include <sys/time.h>
+#include "list.h"
+
+#define HTTP_DL_BUF_LEN         128
+#define HTTP_DL_HOST_LEN        HTTP_DL_BUF_LEN
+#define HTTP_DL_PATH_LEN        HTTP_DL_BUF_LEN
+#define HTTP_DL_URL_LEN         (HTTP_DL_HOST_LEN + HTTP_DL_PATH_LEN)
+#define HTTP_DL_LOCAL_LEN       HTTP_DL_BUF_LEN
+#define HTTP_DL_READBUF_LEN     4096
+
+#define HTTP_DL_READ_TIMEOUT    10  /* 单位秒 */
+
+typedef int bool;
+#define true 1
+#define false 0
+
 typedef struct http_dl_rbuf_s {
     int fd;
     char buffer[4096];              /* the input buffer */
@@ -11,26 +26,53 @@ typedef struct http_dl_rbuf_s {
     int internal_dont_touch_this;   /* used by RBUF_READCHAR macro */
 } http_dl_rbuf_t;
 
-/* Structure containing info on a URL.  */
-typedef struct http_dl_urlinfo_s {
-    char *url;			            /* Unchanged URL */
-    char *host;			            /* Extracted hostname */
-    unsigned short port;
-    char *path;	                    /* Path, as well as dir and file (properly decoded) */
-    char *referer;		            /* The source from which the request URI was obtained */
-    char *local;			        /* The local filename of the URL document */
-} http_dl_urlinfo_t;
+typedef enum http_dl_stage_e {
+    HTTP_DL_STAGE_INIT = 0,         /* 下载任务建立时初始状态 */
+    HTTP_DL_STAGE_SEND_REQUEST,     /* 发送下载请求到服务器，当连接成功建立后置 */
+    HTTP_DL_STAGE_PARSE_STATUS_LINE,/* 解析状态行 */
+    HTTP_DL_STAGE_PARSE_HEADER,     /* 解析头部 */
+    HTTP_DL_STAGE_RECV_CONTENT,     /* 接收包体内容 */
+    HTTP_DL_STAGE_FINISH,           /* 下载完成，如果异常完成，则将错误信息记录到err_msg中 */
+} http_dl_stage_t;
 
-typedef struct http_dl_stat_s {
-    long len;			            /* received length */
-    long contlen;			        /* expected length */
-    long restval;			        /* the restart value */
-    int res;			            /* the result of last read */
-    char *remote_time;		        /* remote time-stamp string */
-    char *error;			        /* textual HTTP error */
-    int statcode;			        /* status code */
-    long dltime;			        /* time of the download */
-} http_dl_stat_t;
+#define HTTP_DL_F_GENUINE_AGENT 0x00000001UL
+
+typedef struct http_dl_info_s {
+    http_dl_stage_t stage;
+    unsigned long flags;
+
+    struct list_head list;
+
+    char url[HTTP_DL_URL_LEN];      /* Unchanged URL */
+    char host[HTTP_DL_HOST_LEN];    /* Extracted hostname */
+    char path[HTTP_DL_PATH_LEN];    /* Path, as well as dir and file (properly decoded) */
+    char local[HTTP_DL_LOCAL_LEN];  /* The local filename of the URL document */
+    unsigned short port;
+
+    int sockfd;
+    int filefd;
+
+    char buf[HTTP_DL_READBUF_LEN];
+    char *buf_data;
+    char *buf_tail;
+
+    long recv_len;                  /* received length */
+    long content_len;               /* this HTTP session expected length */
+    long restart_len;               /* the restart value, for range */
+    int status_code;
+
+    char err_msg[HTTP_DL_BUF_LEN];
+
+    struct timeval start_time;      /* Get content's start time */
+    unsigned long elapsed_time;     /* Duration time of getting contents */
+} http_dl_info_t;
+
+typedef struct http_dl_list_s {
+    char name[HTTP_DL_BUF_LEN];
+    struct list_head list;
+    int count;
+    int maxfd;
+} http_dl_list_t;
 
 typedef struct http_dl_range_s {
     long first_byte_pos;
@@ -38,40 +80,18 @@ typedef struct http_dl_range_s {
     long entity_length;
 } http_dl_range_t;
 
-/* Document-type flags */
-enum {
-    TEXTHTML      = 0x0001,         /* document is of type text/html */
-    RETROKF       = 0x0002,         /* retrieval was OK */
-    HEAD_ONLY     = 0x0004,         /* only send the HEAD request */
-    SEND_NOCACHE  = 0x0008,         /* send Pragma: no-cache directive */
-    ACCEPTRANGES  = 0x0010,     	/* Accept-ranges header was found */
-    GENUINE_AGENT = 0x0020,         /* Using genuine agent, like"wget 1.5.3" */
-};
-
-/* Universal error type -- used almost everywhere.
-   This is, of course, utter crock.  */
 typedef enum http_dl_err_e {
-    RETRFINISHED, NOCONERROR, HOSTERR, CONSOCKERR, CONERROR, CONREFUSED,
-    FOPENERR, FWRITEERR, HEOF, HERR, RETROK, RANGEERR, WRITEFAILED,
+    HTTP_DL_OK = 0,
+    HTTP_DL_ERR_INVALID = 1,        /* 0 stands for success, so errors begin with 1 */
+    HTTP_DL_ERR_INTERNAL,
+    HTTP_DL_ERR_SOCK,
+    HTTP_DL_ERR_CONN,
+    HTTP_DL_ERR_FOPEN,
+    HTTP_DL_ERR_WRITE,
+    HTTP_DL_ERR_READ,
+    HTTP_DL_ERR_EOF,
+    HTTP_DL_ERR_RESOURCE,
 } http_dl_err_t;
-
-enum {
-    HG_OK,
-    HG_ERROR,
-    HG_EOF,
-};
-
-/* Flags for show_progress().  */
-typedef enum http_dl_spflag_e {
-    SP_NONE,
-    SP_INIT,
-    SP_FINISH,
-} http_dl_spflag_t;
-
-typedef enum http_dl_header_get_e {
-    HG_NONE = 0,
-	HG_NO_CONTINUATIONS = 0x2,
-} http_dl_header_get_t;
 
 #define HTTP_URL_PREFIX    "http://"
 #define HTTP_URL_PRE_LEN    7       /* strlen("http://") */
@@ -79,29 +99,29 @@ typedef enum http_dl_header_get_e {
 #define HTTP_ACCEPT "*/*"
 /* HTTP/1.0 status codes from RFC1945, provided for reference.  */
 /* Successful 2xx.  */
-#define HTTP_STATUS_OK			200
-#define HTTP_STATUS_CREATED		201
-#define HTTP_STATUS_ACCEPTED		202
-#define HTTP_STATUS_NO_CONTENT		204
+#define HTTP_STATUS_OK			        200
+#define HTTP_STATUS_CREATED		        201
+#define HTTP_STATUS_ACCEPTED		    202
+#define HTTP_STATUS_NO_CONTENT		    204
 #define HTTP_STATUS_PARTIAL_CONTENTS	206
 
 /* Redirection 3xx.  */
 #define HTTP_STATUS_MULTIPLE_CHOICES	300
 #define HTTP_STATUS_MOVED_PERMANENTLY	301
 #define HTTP_STATUS_MOVED_TEMPORARILY	302
-#define HTTP_STATUS_NOT_MODIFIED	304
+#define HTTP_STATUS_NOT_MODIFIED	    304
 
 /* Client error 4xx.  */
-#define HTTP_STATUS_BAD_REQUEST		400
-#define HTTP_STATUS_UNAUTHORIZED	401
-#define HTTP_STATUS_FORBIDDEN		403
-#define HTTP_STATUS_NOT_FOUND		404
+#define HTTP_STATUS_BAD_REQUEST		    400
+#define HTTP_STATUS_UNAUTHORIZED	    401
+#define HTTP_STATUS_FORBIDDEN		    403
+#define HTTP_STATUS_NOT_FOUND		    404
 
 /* Server errors 5xx.  */
-#define HTTP_STATUS_INTERNAL		500
-#define HTTP_STATUS_NOT_IMPLEMENTED	501
-#define HTTP_STATUS_BAD_GATEWAY		502
-#define HTTP_STATUS_UNAVAILABLE		503
+#define HTTP_STATUS_INTERNAL		    500
+#define HTTP_STATUS_NOT_IMPLEMENTED	    501
+#define HTTP_STATUS_BAD_GATEWAY		    502
+#define HTTP_STATUS_UNAVAILABLE		    503
 #define H_20X(x)        (((x) >= 200) && ((x) < 300))
 #define H_PARTIAL(x)    ((x) == HTTP_STATUS_PARTIAL_CONTENTS)
 #define H_REDIRECTED(x) (((x) == HTTP_STATUS_MOVED_PERMANENTLY)	\
@@ -112,12 +132,6 @@ typedef enum http_dl_header_get_e {
 
 #define RBUF_FD(rbuf) ((rbuf)->fd)
 #define TEXTHTML_S "text/html"
-
-#define HTTP_DL_BUF_LEN     128
-#define HTTP_DL_HOST_LEN    HTTP_DL_BUF_LEN
-#define HTTP_DL_PATH_LEN    HTTP_DL_BUF_LEN
-#define HTTP_DL_URL_LEN     (HTTP_DL_HOST_LEN + HTTP_DL_PATH_LEN)
-#define HTTP_DL_LOCAL_LEN   HTTP_DL_BUF_LEN
 
 #define http_dl_rbuf_readc(rbuf, store)					\
     ((rbuf)->buffer_left							\

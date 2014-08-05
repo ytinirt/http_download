@@ -8,16 +8,19 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
+#include <sys/select.h>
 
 #include "http_download.h"
 
-int http_dl_log_level = 5;
+int http_dl_log_level = 7;
 
-/* Internal variables used by the timer.  */
-static long http_dl_internal_secs, http_dl_internal_msecs;
 static char *http_dl_agent_string = "Mozilla/5.0 (Windows NT 6.1; WOW64) " \
                                     "AppleWebKit/537.36 (KHTML, like Gecko) " \
                                     "Chrome/35.0.1916.153 Safari/537.36";
+static char *http_dl_agent_string_genuine = "Wget/1.5.3";
+static http_dl_list_t http_dl_list_initial;
+static http_dl_list_t http_dl_list_downloading;
+static http_dl_list_t http_dl_list_finished;
 
 /* Count the digits in a (long) integer.  */
 static int http_dl_numdigit(long a)
@@ -31,48 +34,50 @@ static int http_dl_numdigit(long a)
     return res;
 }
 
-/* Create an internet connection to HOSTNAME on PORT.  The created
-   socket will be stored to *SOCK.  */
-http_dl_err_t http_dl_connect(int *sock, char *hostname, unsigned short port)
+static int http_dl_conn(char *hostname, unsigned short port)
 {
     int ret;
-    struct sockaddr_in sock_name;
-    /* struct hostent *hptr; */
+    struct sockaddr_in sa;
 
-    bzero(&sock_name, sizeof(sock_name));
-    ret = inet_pton(AF_INET, hostname, &sock_name.sin_addr);
+    if (hostname == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    bzero(&sa, sizeof(sa));
+    ret = inet_pton(AF_INET, hostname, &sa.sin_addr);
     if (ret != 1) {
-        return HOSTERR;
+        return -HTTP_DL_ERR_INVALID;
     }
 
     /* Set port and protocol */
-    sock_name.sin_family = AF_INET;
-    sock_name.sin_port = htons(port);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
 
     /* Make an internet socket, stream type.  */
-    if ((*sock = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-        return CONSOCKERR;
+    if ((ret = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+        return -HTTP_DL_ERR_SOCK;
     }
 
     /* Connect the socket to the remote host.  */
-    if (connect(*sock, (struct sockaddr *)&sock_name, sizeof(sock_name))) {
-        if (errno == ECONNREFUSED) {
-            return CONREFUSED;
-        } else {
-            return CONERROR;
-        }
+    if (connect(ret, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        close(ret);
+        return -HTTP_DL_ERR_CONN;
     }
 
-    http_dl_log_debug("Created socket fd %d.", *sock);
+    http_dl_log_debug("Created and connected socket fd %d.", ret);
 
-    return NOCONERROR;
+    return ret;
 }
 
 static int http_dl_iwrite(int fd, char *buf, int len)
 {
     int res = 0;
 
-    /* `write' may write less than LEN bytes, thus the outward loop
+    if (buf == NULL || len <= 0) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    /* 'write' may write less than LEN bytes, thus the outward loop
     keeps trying it until all was written, or an error occurred.  The
     inner loop is reserved for the usual EINTR f*kage, and the
     innermost loop deals with the same during select().  */
@@ -81,19 +86,12 @@ static int http_dl_iwrite(int fd, char *buf, int len)
             res = write(fd, buf, len);
         } while (res == -1 && errno == EINTR);
         if (res <= 0) {
-            break;
+            return -HTTP_DL_ERR_WRITE;
         }
         buf += res;
         len -= res;
     }
-    return res;
-}
-
-static void http_dl_init_rbuf(http_dl_rbuf_t *rbuf, int fd)
-{
-    rbuf->fd = fd;
-    rbuf->buffer_pos = rbuf->buffer;
-    rbuf->buffer_left = 0;
+    return len;
 }
 
 static void *http_dl_xrealloc(void *obj, size_t size)
@@ -116,6 +114,7 @@ static void *http_dl_xrealloc(void *obj, size_t size)
     return res;
 }
 
+#if 0
 /* Read at most LEN bytes from FD, storing them to BUF.  This is
    virtually the same as read(), but takes care of EINTR braindamage
    and uses select() to timeout the stale connections (a connection is
@@ -125,110 +124,21 @@ static int http_dl_iread(int fd, char *buf, int len)
 {
     int res;
 
+    if (buf == NULL || len <= 0) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
     do {
         res = read(fd, buf, len);
     } while (res == -1 && errno == EINTR);
 
-    return res;
-}
-
-/* Like http_dl_rbuf_readc(), only don't move the buffer position.  */
-static int http_dl_peek_rbuf(http_dl_rbuf_t *rbuf, char *store)
-{
-    int res;
-
-    if (rbuf->buffer_left == 0) {
-        rbuf->buffer_pos = rbuf->buffer;
-        rbuf->buffer_left = 0;
-        res = http_dl_iread(rbuf->fd, rbuf->buffer, sizeof(rbuf->buffer));
-        if (res <= 0) {
-            return res;
-        }
-        rbuf->buffer_left = res;
+    if (res > 0) {
+        return res;
+    } else if (res == 0) {
+        return -HTTP_DL_ERR_EOF;
+    } else {
+        return -HTTP_DL_ERR_READ;
     }
-
-    *store = *rbuf->buffer_pos;
-    return 1;
-}
-
-/* Get a header from read-buffer RBUF and return it in *HDR.
-
-   As defined in RFC2068 and elsewhere, a header can be folded into
-   multiple lines if the continuation line begins with a space or
-   horizontal TAB.  Also, this function will accept a header ending
-   with just LF instead of CRLF.
-
-   The header may be of arbitrary length; the function will allocate
-   as much memory as necessary for it to fit.  It need not contain a
-   `:', thus you can use it to retrieve, say, HTTP status line.
-
-   The trailing CRLF or LF are stripped from the header, and it is
-   zero-terminated.   #### Is this well-behaved?  */
-static int http_dl_get_header(http_dl_rbuf_t *rbuf, char **hdr, http_dl_header_get_t flags)
-{
-    int i;
-    int res;
-    int bufsize = 128;
-    char *p;
-
-    p = (char *)malloc(bufsize);
-    *hdr = p;
-    if (p == NULL) {
-        http_dl_log_debug("alloc %d failed", bufsize);
-        return HG_ERROR;
-    }
-    bzero(p, bufsize);
-
-    for (i = 0; 1; i++) {
-        if (i > bufsize - 1) {
-            p = (char *)http_dl_xrealloc(p, (bufsize <<= 1));
-            *hdr = p;   /* 更新返回值 */
-            if (p == NULL) {
-                http_dl_log_debug("alloc %d failed", bufsize);
-                return HG_ERROR;
-            }
-            bzero(p, bufsize);
-        }
-        res = http_dl_rbuf_readc(rbuf, p + i);
-        if (res == 1) {
-            if (p[i] == '\n') {
-                if (!((flags & HG_NO_CONTINUATIONS)
-                        || i == 0
-                        || (i == 1 && p[0] == '\r'))) {
-                    char next;
-                    /* If the header is non-empty, we need to check if
-                    it continues on to the other line.  We do that by
-                    peeking at the next character.  */
-                    res = http_dl_peek_rbuf(rbuf, &next);
-                    if (res == 0) {
-                        return HG_EOF;
-                    } else if (res == -1) {
-                        return HG_ERROR;
-                    }
-                    /*  If the next character is HT or SP, just continue.  */
-                    if (next == '\t' || next == ' ')
-                    continue;
-                }
-
-                /* The header ends.  */
-                p[i] = '\0';
-                /* Get rid of '\r'.  */
-                if (i > 0 && p[i - 1] == '\r') {
-                    p[i - 1] = '\0';
-                }
-
-                break;
-            }
-        } else if (res == 0) {
-            return HG_EOF;
-        } else {
-            return HG_ERROR;
-        }
-    }
-
-    http_dl_log_debug("%s", p);
-
-    return HG_OK;
 }
 
 /* Parse the HTTP status line, which is of format:
@@ -244,10 +154,14 @@ static int http_dl_parse_status_line(const char *line)
     int mjr, mnr, statcode;
     const char *p;
 
+    if (line == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
     /* The standard format of HTTP-Version is: `HTTP/X.Y', where X is
      major version, and Y is minor version.  */
     if (strncmp(line, "HTTP/", 5) != 0) {
-        return -1;
+        return -HTTP_DL_ERR_INVALID;
     }
     line += 5;
 
@@ -257,7 +171,7 @@ static int http_dl_parse_status_line(const char *line)
         mjr = 10 * mjr + (*line - '0');
     }
     if (*line != '.' || p == line) {
-        return -1;
+        return -HTTP_DL_ERR_INVALID;
     }
     ++line;
 
@@ -267,18 +181,18 @@ static int http_dl_parse_status_line(const char *line)
         mnr = 10 * mnr + (*line - '0');
     }
     if (*line != ' ' || p == line) {
-        return -1;
+        return -HTTP_DL_ERR_INVALID;
     }
     /* Wget will accept only 1.0 and higher HTTP-versions.  The value of
      minor version can be safely ignored.  */
     if (mjr < 1) {
-        return -1;
+        return -HTTP_DL_ERR_INVALID;
     }
     ++line;
 
     /* Calculate status code.  */
     if (!(isdigit(*line) && isdigit(line[1]) && isdigit(line[2]))) {
-        return -1;
+        return -HTTP_DL_ERR_INVALID;
     }
     statcode = 100 * (*line - '0') + 10 * (line[1] - '0') + (line[2] - '0');
 
@@ -290,7 +204,7 @@ static int http_dl_parse_status_line(const char *line)
         if (*line != '\0') {
             http_dl_log_debug("reason: %s", line);
         } else {
-            return -1;
+            return -HTTP_DL_ERR_INVALID;
         }
     } else {
         http_dl_log_debug("Reason: %s", line + 1);
@@ -304,6 +218,10 @@ static int http_dl_parse_status_line(const char *line)
 static int http_dl_clac_lws(const char *string)
 {
     const char *p = string;
+
+    if (string == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
 
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
         ++p;
@@ -446,151 +364,37 @@ static int http_dl_header_parse_range(const char *hdr, void *arg)
     closure->entity_length = num;
     return 1;
 }
+#endif
 
-/* Reset the internal timer.  */
-static void http_dl_reset_time(void)
+static void http_dl_reset_time(http_dl_info_t *di)
 {
-    struct timeval t;
+    if (di == NULL) {
+        return;
+    }
 
-    gettimeofday (&t, NULL);
-    http_dl_internal_secs = t.tv_sec;
-    http_dl_internal_msecs = t.tv_usec / 1000;
+    gettimeofday(&di->start_time, NULL);
+    di->elapsed_time = -1;  /* for unsigned long, -1 means maximum time */
 }
 
-static long http_dl_elapsed_time(void)
+/* unit is msecs */
+static unsigned long http_dl_calc_elapsed(http_dl_info_t *di)
 {
     struct timeval t;
-    long ret;
+    unsigned long ret;
+
+    if (di == NULL) {
+        return -1;
+    }
 
     gettimeofday(&t, NULL);
-    ret = ((t.tv_sec - http_dl_internal_secs) * 1000 + (t.tv_usec / 1000 - http_dl_internal_msecs));
+    ret = (t.tv_sec - di->start_time.tv_sec) * 1000
+           + (t.tv_usec - di->start_time.tv_usec) / 1000;
+    di->elapsed_time = ret;
 
     return ret;
 }
 
-/* Flush RBUF's buffer to WHERE.  Flush MAXSIZE bytes at most.
-   Returns the number of bytes actually copied.  If the buffer is
-   empty, 0 is returned.  */
-static int http_dl_flush_rbuf(http_dl_rbuf_t *rbuf, char *where, int maxsize)
-{
-    int howmuch;
-
-    if (rbuf->buffer_left == 0 || maxsize < 0) {
-        return 0;
-    } else {
-        howmuch = MINVAL(rbuf->buffer_left, maxsize);
-        if (where) {
-            memcpy(where, rbuf->buffer_pos, howmuch);
-        }
-        rbuf->buffer_left -= howmuch;
-        rbuf->buffer_pos += howmuch;
-        return howmuch;
-    }
-}
-
-static void http_dl_sp_percentage(long bytes, long expected)
-{
-    int percentage = (int)(100.0 * bytes / expected);
-    http_dl_print_raw(" [%3d%%]", percentage);
-}
-
-/* Show the dotted progress report of file loading.  Called with
-   length and a flag to tell it whether to reset or not.  It keeps the
-   offset information in static local variables.
-
-   Return value: 1 or 0, designating whether any dots have been drawn.
-
-   If the init argument is set, the routine will initialize.
-
-   If the res is non-zero, res/line_bytes lines are skipped
-   (meaning the appropriate number ok kilobytes), and the number of
-   "dots" fitting on the first line are drawn as ','.  */
-#define HTTP_DL_SP_DOTS_IN_LINE     48
-#define HTTP_DL_SP_DOT_SPACING      16
-#define HTTP_DL_SP_DOT_BYTES        (0x1 << 14)
-static int http_dl_show_progress(long res, long expected, http_dl_spflag_t flags)
-{
-    static long line_bytes;
-    static long offs;
-    static int ndot, nrow = 0;
-    int any_output = 0;
-    int dots_in_line = HTTP_DL_SP_DOTS_IN_LINE;
-    int dot_spacing = HTTP_DL_SP_DOT_SPACING;
-    int dot_bytes = HTTP_DL_SP_DOT_BYTES;
-
-    if (flags == SP_FINISH) {
-        if (expected) {
-            int dot = ndot;
-            char tmpstr[2 * HTTP_DL_SP_DOTS_IN_LINE + 1];
-            char *tmpp = tmpstr;
-            bzero(tmpstr, sizeof(tmpstr));
-            for (; dot < dots_in_line; dot++) {
-                if (!(dot % dot_spacing)) {
-                    *tmpp++ = ' ';
-                }
-                *tmpp++ = ' ';
-            }
-            *tmpp = '\0';
-            http_dl_print_raw("%s", tmpstr);
-            http_dl_sp_percentage(nrow * line_bytes + ndot * dot_bytes + offs, expected);
-        }
-        http_dl_print_raw("\n\n");
-        return 0;
-    }
-
-    /* Temporarily disable flushing.  */
-    /* init set means initialization.  If res is set, it also means that
-    the retrieval is *not* done from the beginning.  The part that
-    was already retrieved is not shown again.  */
-    if (flags == SP_INIT) {
-        /* Generic initialization of static variables.  */
-        offs = 0L;
-        ndot = 0;
-        nrow = 0;
-        line_bytes = (long)dots_in_line * dot_bytes;
-        if (res) {
-            if (res >= line_bytes) {
-                nrow = res / line_bytes;
-                res %= line_bytes;
-                http_dl_print_raw("\n          [ skipping %dK ]", (int) ((nrow * line_bytes) >> 10));
-                ndot = 0;
-            }
-        }
-        http_dl_print_raw("\n%5ldK ->", (nrow * line_bytes) >> 10);
-    }
-
-    /* Offset gets incremented by current value.  */
-    offs += res;
-
-    /*
-     * While offset is >= opt.dot_bytes, print dots, taking care to
-     * precede every 50th dot with a status message.
-     */
-    for ( ; offs >= dot_bytes; offs -= dot_bytes) {
-        if (!(ndot % dot_spacing)) {
-            http_dl_print_raw(" ");
-        }
-        any_output = 1;
-        http_dl_print_raw("%s", flags == SP_INIT ? "," : ".");
-        ++ndot;
-        if (ndot == dots_in_line) {
-            ndot = 0;
-            ++nrow;
-            if (expected) {
-                http_dl_sp_percentage(nrow * line_bytes, expected);
-            }
-            http_dl_print_raw("\n%5ldK ->", (nrow * line_bytes) >> 10);
-        }
-    }
-
-    /* Reenable flushing.  */
-    if (any_output) {
-        (void)0;
-    }
-
-    return any_output;
-}
-
+#if 0
 /* Reads the contents of file descriptor FD, until it is closed, or a
    read error occurs.  The data is read in 8K chunks, and stored to
    stream fp, which should have been open for writing.  If BUF is
@@ -1002,112 +806,563 @@ done_header:
 
     return RETRFINISHED;
 }
+#endif
 
-int main(int argc, char *argv[])
+static http_dl_info_t *http_dl_create_info(char *url)
 {
-    int ret, avrspd;
-    http_dl_urlinfo_t ui;
-    http_dl_stat_t hs;
-    int dt = 0;
-    char host[HTTP_DL_HOST_LEN], local[HTTP_DL_LOCAL_LEN], path[HTTP_DL_PATH_LEN];
-    char *p, *q;
+    http_dl_info_t *di;
+    int url_len;
+    char *p, *host, *path, *local;
+    int host_len, path_len, local_len;
+    int port = 0;
 
-    if (argc != 2 && argc != 3) {
-        http_dl_print_raw("Usage: %s URL [Referer]\n", argv[0]);
-        return -1;
+    if (url == NULL) {
+        http_dl_log_debug("invalid input url");
+        return NULL;
     }
 
-    bzero(&ui, sizeof(ui));
-    bzero(&hs, sizeof(hs));
-    bzero(host, HTTP_DL_HOST_LEN);
-    bzero(local, HTTP_DL_LOCAL_LEN);
-    bzero(path, HTTP_DL_PATH_LEN);
+    url_len = strlen(url);
+    if (url_len >= HTTP_DL_URL_LEN) {
+        http_dl_log_debug("url is longer than %d: %s", HTTP_DL_URL_LEN - 1, url);
+        return NULL;
+    }
 
-    /* 解析host */
-    if (strstr(argv[1], HTTP_URL_PREFIX) != NULL) {
-        q = argv[1] + HTTP_URL_PRE_LEN;
+    if ((p = strstr(url, HTTP_URL_PREFIX)) != NULL) {
+        p = p + HTTP_URL_PRE_LEN;
     } else {
-        q = argv[1];
+        p = url;
     }
-    for (p = host; p < host + HTTP_DL_HOST_LEN - 1 && *q != '/' && *q != '\0'; p++, q++) {
-        *p = *q;
+
+    /* 解析host，以及可能存在的port */
+    for (host = p, host_len = 0; *p != '/' && *p != ':' && *p != '\0'; p++, host_len++) {
+        (void)0;
     }
-    if (p == host + HTTP_DL_HOST_LEN - 1) {
-        http_dl_log_error("host length longer than %d", HTTP_DL_HOST_LEN - 1);
-        return -1;
+    if (*p == ':') {
+        p++;
+        while (isdigit(*p)) {
+            port = port * 10 + (*p - '0');
+            if (port > 0xFFFF) {
+                http_dl_log_debug("invalid port: %s", url);
+                return NULL;
+            }
+            p++;
+        }
+        if (*p != '/') {
+            http_dl_log_debug("invalid port: %s", url);
+            return NULL;
+        }
+    } else if (*p == '\0') {
+        http_dl_log_debug("invalid host: %s", host);
+        return NULL;
+    }
+    if (host_len <= 0 || host_len >= HTTP_DL_HOST_LEN) {
+        http_dl_log_debug("invalid host length: %s", host);
+        return NULL;
     }
 
     /* 解析path */
-    for (p = path; p < path + HTTP_DL_PATH_LEN - 1; p++, q++) {
-        if (*q == '\n' || *q == '\0' || *q == ' ') {
-            break;
-        } else {
-            *p = *q;
-        }
-    }
-    if (p == path + HTTP_DL_PATH_LEN - 1) {
-        http_dl_log_error("path length longer than %d", HTTP_DL_PATH_LEN - 1);
-        return -1;
-    }
-
-    /* 解析本地保存文件名 */
-    q = argv[1] + strlen(argv[1]);
-    for ( ; *q != '/' && q > argv[1]; q--) {
+    for (path = p, path_len = 0; *p != '\0' && *p != ' ' && *p != '\n'; p++, path_len++) {
         (void)0;
     }
-    if (q <= argv[1]) {
-        http_dl_log_error("invalid URL, get local file name failed");
-        return -1;
-    }
-    for (p = local, q = q + 1; p < local + HTTP_DL_LOCAL_LEN -1; p++, q++) {
-        if (*q == '\n' || *q == '\0' || *q == ' ') {
-            break;
-        } else {
-            *p = *q;
-        }
-    }
-    if (p == local + HTTP_DL_LOCAL_LEN - 1) {
-        http_dl_log_error("local file name longer than %d", HTTP_DL_LOCAL_LEN - 1);
-        return -1;
+    if (path_len <= 0 || path_len >= HTTP_DL_PATH_LEN) {
+        http_dl_log_debug("invalid path length: %s", path);
+        return NULL;
     }
 
-    ui.url = argv[1];
-    ui.host = host;
-    ui.local = local;
-    ui.path = path;
-    ui.port = 80;
-    if (argc == 3) {
-        ui.referer = argv[2];
+    /* 解析本地保存文件名local */
+    p--;
+    for (local_len = 0; *p != '/'; p--, local_len++) {
+        (void)0;
     }
-    dt |= ACCEPTRANGES;
-
-    ret = http_dl_get(&ui, &hs, &dt);
-
-    http_dl_log_debug("gethttp return %d\n", ret);
-    http_dl_log_debug("HS error: %s\n", hs.error);
-    http_dl_log_debug("HS remote time: %s\n", hs.remote_time);
-    http_dl_log_debug("HS status code: %d\n", hs.statcode);
-    http_dl_log_debug("HS delta time: %ld\n", hs.dltime);
-    http_dl_log_debug("HS content length: %ld, (receive %ld)\n", hs.contlen, hs.len);
-
-    http_dl_free(hs.remote_time);
-
-    if (ret != RETRFINISHED) {
-        http_dl_log_error("http_dl_get file failed, %d", ret);
-        return -1;
+    local = p + 1;
+    if (local_len <= 0 || local_len >= HTTP_DL_LOCAL_LEN) {
+        http_dl_log_debug("invalid local file name: %s", local);
+        return NULL;
     }
 
-    if (hs.dltime != 0) {
-        avrspd = hs.len / hs.dltime;
+    di = http_dl_xrealloc(NULL, sizeof(http_dl_info_t));
+    if (di == NULL) {
+        http_dl_log_debug("allocate failed");
+        return NULL;
+    }
+
+    bzero(di, sizeof(http_dl_info_t));
+    memcpy(di->url, url, url_len);
+    memcpy(di->host, host, host_len);
+    memcpy(di->path, path, path_len);
+    memcpy(di->local, local, local_len);
+    if (port != 0) {
+        di->port = port;
     } else {
-        avrspd = 0;
+        di->port = 80;  /* 默认的http服务端口 */
     }
-    http_dl_log_info("Content %ld KB, receive %ld KB, time %ld sec, average speed %d KB/s",
-                        (hs.contlen >> 10),
-                        (hs.len >> 10),
-                        (hs.dltime / 1000),
-                        avrspd);
 
-    return 0;
+    di->stage = HTTP_DL_STAGE_INIT;
+    INIT_LIST_HEAD(&di->list);
+
+    di->recv_len = 0;
+    di->content_len = 0;
+    di->restart_len = 0;
+    di->status_code = HTTP_DL_OK;
+    di->sockfd = -1;
+    di->filefd = -1;
+
+    di->buf_data = di->buf;
+    di->buf_tail = di->buf;
+
+    return di;
 }
 
+static void http_dl_add_info_to_list(http_dl_info_t *info, http_dl_list_t *list)
+{
+    if (info == NULL || list == NULL) {
+        return;
+    }
+
+    list_add_tail(&info->list, &list->list);
+    list->count++;
+}
+
+static void http_dl_add_info_to_download_list(http_dl_info_t *info)
+{
+    if (info == NULL) {
+        return;
+    }
+
+    http_dl_add_info_to_list(info, &http_dl_list_downloading);
+    if (http_dl_list_downloading.maxfd < info->sockfd) {
+        http_dl_list_downloading.maxfd = info->sockfd;
+    }
+}
+
+static void http_dl_del_info_from_download_list(http_dl_info_t *info)
+{
+    if (info == NULL) {
+        return;
+    }
+
+    list_del_init(&info->list);
+    http_dl_list_downloading.count--;
+    if (http_dl_list_downloading.count == 0) {
+        http_dl_list_downloading.maxfd = -1;
+    } else {
+        /*
+         * 注意: 此时应搜索downloading list，找出新的maxfd，但使用下面的方法，能快速找到一个
+         *       不那么正确，但可用的值
+         */
+        if (http_dl_list_downloading.maxfd == info->sockfd) {
+            http_dl_list_downloading.maxfd = info->sockfd - 1;
+        }
+    }
+}
+
+static void http_dl_init()
+{
+    http_dl_list_initial.count = 0;
+    http_dl_list_initial.maxfd = -1;
+    INIT_LIST_HEAD(&http_dl_list_initial.list);
+    sprintf(http_dl_list_initial.name, "Initial list");
+
+    http_dl_list_downloading.count = 0;
+    http_dl_list_downloading.maxfd = -1;
+    INIT_LIST_HEAD(&http_dl_list_downloading.list);
+    sprintf(http_dl_list_downloading.name, "Downloading list");
+
+    http_dl_list_finished.count = 0;
+    http_dl_list_finished.maxfd = -1;
+    INIT_LIST_HEAD(&http_dl_list_finished.list);
+    sprintf(http_dl_list_finished.name, "Finished list");
+}
+
+static void http_dl_list_destroy(http_dl_list_t *list)
+{
+    http_dl_info_t *info, *next_info;
+
+    if (list == NULL) {
+        return;
+    }
+
+    list_for_each_entry_safe(info, next_info, &list->list, list, http_dl_info_t) {
+        http_dl_log_debug("[%s] delete %s", list->name, info->url);
+        list_del_init(&info->list);
+        http_dl_free(info);
+        list->count--;
+    }
+
+    if (list->count != 0) {
+        http_dl_log_error("[%s] FATAL error, after destroy list->count %d (should 0).",
+                                list->name, list->count);
+    } else {
+        http_dl_log_debug("[%s] destroy success.", list->name);
+    }
+}
+
+static void http_dl_destroy()
+{
+    http_dl_list_destroy(&http_dl_list_initial);
+    http_dl_list_destroy(&http_dl_list_downloading);
+    http_dl_list_destroy(&http_dl_list_finished);
+}
+
+static void http_dl_list_debug(http_dl_list_t *list)
+{
+    http_dl_info_t *info;
+
+    if (list == NULL) {
+        return;
+    }
+
+    http_dl_print_raw("\n%s [%d]:\n", list->name, list->count);
+    list_for_each_entry(info, &list->list, list, http_dl_info_t) {
+        if (info->recv_len == 0) {
+            http_dl_print_raw("\t%s\n", info->url);
+        } else if (info->elapsed_time == -1) {
+            http_dl_print_raw("\t%s [%ld KB]\n", info->local, info->recv_len >> 10);
+        } else {
+            http_dl_print_raw("\t%s [%ld KB] [%ld KB/s]\n",
+                                info->local, info->recv_len >> 10, info->recv_len / info->elapsed_time);
+        }
+    }
+    http_dl_print_raw("--------------\n");
+}
+
+static void http_dl_debug_show()
+{
+    http_dl_list_debug(&http_dl_list_initial);
+    http_dl_list_debug(&http_dl_list_downloading);
+    http_dl_list_debug(&http_dl_list_finished);
+}
+
+static int http_dl_send_req(http_dl_info_t *di)
+{
+    int ret, nwrite;
+    char range[HTTP_DL_BUF_LEN], *useragent;
+    char *request;
+    int request_len;
+    char *command = "GET";
+
+    if (di == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    if (di->stage < HTTP_DL_STAGE_SEND_REQUEST) {
+        ret = http_dl_conn(di->host, di->port);
+        if (ret < 0) {
+            http_dl_log_debug("connect failed: %s:%d", di->host, di->port);
+            return -HTTP_DL_ERR_CONN;
+        }
+        di->sockfd = ret;
+        di->stage = HTTP_DL_STAGE_SEND_REQUEST;
+    }
+
+    bzero(range, sizeof(range));
+    if (di->restart_len != 0) { /* 断点续传 */
+        if (sizeof(range) < (http_dl_numdigit(di->restart_len) + 17)) {
+            http_dl_log_error("range string is longer than %d", sizeof(range) - 17);
+            return -HTTP_DL_ERR_INVALID;
+        }
+        sprintf(range, "Range: bytes=%ld-\r\n", di->restart_len);
+    }
+
+    if (di->flags & HTTP_DL_F_GENUINE_AGENT) {
+        useragent = http_dl_agent_string_genuine;
+    } else {
+        useragent = http_dl_agent_string;
+    }
+
+    request_len = strlen(command) + strlen(di->path)
+                + strlen(useragent)
+                + strlen(di->host) + http_dl_numdigit(di->port)
+                + strlen(HTTP_ACCEPT)
+                + strlen(range)
+                + 64;
+    request = http_dl_xrealloc(NULL, request_len);
+    if (request == NULL) {
+        http_dl_log_error("allocate request buffer %d failed.", request_len);
+        return -HTTP_DL_ERR_RESOURCE;
+    }
+
+    bzero(request, request_len);
+    sprintf(request, "%s %s HTTP/1.0\r\n"
+                     "User-Agent: %s\r\n"
+                     "Host: %s:%d\r\n"
+                     "Accept: %s\r\n"
+                     "%s\r\n",
+                     command, di->path,
+                     useragent,
+                     di->host, di->port,
+                     HTTP_ACCEPT,
+                     range);
+    http_dl_log_debug("\n--- request begin ---\n%s--- request end ---\n", request);
+
+    nwrite = http_dl_iwrite(di->sockfd, request, strlen(request));
+    if (nwrite < 0) {
+        http_dl_log_debug("write HTTP request failed.");
+        ret = -HTTP_DL_ERR_WRITE;
+        goto err_out;
+    }
+
+    http_dl_log_info("HTTP request sent, awaiting response...");
+    http_dl_reset_time(di);
+    ret = HTTP_DL_OK;
+
+err_out:
+    http_dl_free(request);
+
+    return ret;
+}
+
+static void http_dl_list_proc_initial()
+{
+    http_dl_list_t *dl_list;
+    http_dl_info_t *info, *next_info;
+    int res;
+
+    dl_list = &http_dl_list_initial;
+
+    if (dl_list->count == 0) {
+        return;
+    }
+
+    list_for_each_entry_safe(info, next_info, &dl_list->list, list, http_dl_info_t) {
+        list_del_init(&info->list);
+        dl_list->count--;
+        res = http_dl_send_req(info);
+        if (res == HTTP_DL_OK) {
+            http_dl_add_info_to_download_list(info);
+        } else {
+            http_dl_log_debug("re-add %s to %s", info->url, dl_list->name);
+            http_dl_add_info_to_list(info, dl_list);
+        }
+    }
+
+    return;
+}
+
+static http_dl_info_t *http_dl_find_info_by_sockfd(http_dl_list_t *l, int sockfd)
+{
+    http_dl_info_t *info;
+
+    if (l == NULL) {
+        return NULL;
+    }
+
+    list_for_each_entry(info, &l->list, list, http_dl_info_t) {
+        if (info->sockfd == sockfd) {
+            return info;
+        }
+    }
+
+    return NULL;
+}
+
+static int http_dl_recv_resp(http_dl_info_t *info)
+{
+    int nread, free_space;
+
+    if (info == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    if (info->stage < HTTP_DL_STAGE_RECV_CONTENT) {
+        info->stage = HTTP_DL_STAGE_RECV_CONTENT;
+    }
+
+    free_space = info->buf + HTTP_DL_READBUF_LEN - info->buf_tail;
+    if (free_space < (HTTP_DL_READBUF_LEN >> 2)) {
+        http_dl_log_debug("WARNING: info buffer free space %d too small", free_space);
+    }
+
+    nread = read(info->sockfd, info->buf_tail, free_space);
+    if (nread == 0) {
+        /* XXX: 下载结束，需要把info buffer里面的数据全部flush到文件中 */
+        return -HTTP_DL_ERR_EOF;
+    } else if (nread < 0) {
+        http_dl_log_error("read failed, %d", nread);
+        return -HTTP_DL_ERR_READ;
+    }
+
+    info->buf_tail += nread;
+    info->recv_len += nread;
+
+    /* XXX TODO: 从这里开始处理网络读数据 */
+    info->buf_tail = info->buf;
+
+    return HTTP_DL_OK;
+}
+
+static void http_dl_finish_req(http_dl_info_t *info)
+{
+    if (info == NULL) {
+        return;
+    }
+
+    if (info->filefd >= 0) {
+        http_dl_log_debug("close opened file fd %d", info->filefd);
+        close(info->filefd);
+        info->filefd = -1;
+    }
+
+    if (info->sockfd >= 0) {
+        http_dl_log_debug("close opened socket fd %d", info->sockfd);
+        close(info->sockfd);
+        info->sockfd = -1;
+    }
+
+    http_dl_calc_elapsed(info);
+
+    info->stage = HTTP_DL_STAGE_FINISH;
+    http_dl_add_info_to_list(info, &http_dl_list_finished);
+}
+
+static int http_dl_list_proc_downloading()
+{
+    http_dl_list_t *dl_list;
+    http_dl_info_t *info;
+    struct timeval tv;
+    fd_set rset, rset_org;
+    int res, fd, read_res;
+
+    dl_list = &http_dl_list_downloading;
+    if (dl_list->count == 0) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    FD_ZERO(&rset_org);
+    list_for_each_entry(info, &dl_list->list, list, http_dl_info_t) {
+        FD_SET(info->sockfd, &rset_org);
+    }
+
+    while (1) {
+        if (dl_list->count == 0) {
+            http_dl_log_info("All finished...");
+            break;
+        }
+
+        bzero(&tv, sizeof(tv));
+        tv.tv_sec = HTTP_DL_READ_TIMEOUT;
+        tv.tv_usec = 0;
+
+        FD_ZERO(&rset);
+        memcpy(&rset, &rset_org, sizeof(fd_set));
+
+        res = select(dl_list->maxfd + 1, &rset, NULL, NULL, &tv);
+        if (res == 0) {
+            /* 超时 */
+            http_dl_log_debug("select timeout (%d secs)", HTTP_DL_READ_TIMEOUT);
+            continue;
+        } else if (res == -1 && errno == EINTR) {
+            /* 被中断 */
+            http_dl_log_debug("select interrupted by signal.");
+            continue;
+        } else if (res < 0){
+            /* 出错 */
+            http_dl_log_error("select failed, return %d", res);
+            continue;
+        }
+
+        /* 有数据到达 */
+        for (fd = 0; fd <= dl_list->maxfd && res > 0; fd++) {
+            if (!FD_ISSET(fd, &rset)) {
+                continue;
+            }
+
+            res--;
+            info = http_dl_find_info_by_sockfd(dl_list, fd);
+            if (info == NULL) {
+                http_dl_log_error("FATAL ERROR: sockfd %d not match any info entity", fd);
+                continue;
+            }
+
+            read_res = http_dl_recv_resp(info);
+            if (read_res == -HTTP_DL_ERR_EOF) {
+                /* 该次下载结束 */
+                FD_CLR(fd, &rset_org);
+                http_dl_del_info_from_download_list(info);
+                http_dl_finish_req(info);
+                continue;
+            } else if (read_res == HTTP_DL_OK) {
+                /* 该次下载正常接收数据，可以再次继续 */
+                continue;
+            } else {
+                /* 下载，处理遇到问题 */
+                http_dl_log_error("receive data from %s, sockfd %d failed.",
+                                        info->url, info->sockfd);
+                continue;
+            }
+        }
+    }
+
+    return HTTP_DL_OK;
+}
+
+static int http_dl_list_proc_finished()
+{
+    return HTTP_DL_OK;
+}
+
+int main(int argc, char *argv[])
+{
+    FILE *fp;
+    char url_buf[HTTP_DL_URL_LEN];
+    int url_len, ret = HTTP_DL_OK;
+    http_dl_info_t *di;
+
+    if (argc != 2) {
+        http_dl_print_raw("Usage: %s <url_list.txt>\n", argv[0]);
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    http_dl_init();
+
+    fp = fopen(argv[1], "r");
+    if (fp == NULL) {
+        http_dl_log_error("Open file %s failed", argv[1]);
+        return -HTTP_DL_ERR_FOPEN;
+    }
+
+    while (1) {
+        bzero(url_buf, sizeof(url_buf));
+        if (fgets(url_buf, sizeof(url_buf), fp) == NULL) {
+            break;
+        }
+
+        url_len = strlen(url_buf);
+        if (url_buf[url_len - 1] != '\n') {
+            http_dl_log_error("URL in file %s is too long", argv[1]);
+            ret = -HTTP_DL_ERR_INVALID;
+            goto err_out;
+        }
+        url_buf[url_len - 1] = '\0';
+
+        di = http_dl_create_info(url_buf);
+        if (di == NULL) {
+            http_dl_log_info("Create download task %s failed.", url_buf);
+            continue;
+        }
+
+        http_dl_add_info_to_list(di, &http_dl_list_initial);
+
+        http_dl_log_info("Create download task %s success.", url_buf);
+    }
+
+    http_dl_debug_show();
+
+    http_dl_list_proc_initial();
+
+    http_dl_debug_show();
+
+    http_dl_list_proc_downloading();
+
+    http_dl_debug_show();
+
+    http_dl_list_proc_finished();
+
+    http_dl_debug_show();
+
+err_out:
+    http_dl_destroy();
+    fclose(fp);
+
+    return ret;
+}
