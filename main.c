@@ -12,7 +12,7 @@
 
 #include "http_download.h"
 
-int http_dl_log_level = 7;
+int http_dl_log_level = 6;
 
 static char *http_dl_agent_string = "Mozilla/5.0 (Windows NT 6.1; WOW64) " \
                                     "AppleWebKit/537.36 (KHTML, like Gecko) " \
@@ -1139,23 +1139,6 @@ static void http_dl_list_proc_initial()
     return;
 }
 
-static http_dl_info_t *http_dl_find_info_by_sockfd(http_dl_list_t *l, int sockfd)
-{
-    http_dl_info_t *info;
-
-    if (l == NULL) {
-        return NULL;
-    }
-
-    list_for_each_entry(info, &l->list, list, http_dl_info_t) {
-        if (info->sockfd == sockfd) {
-            return info;
-        }
-    }
-
-    return NULL;
-}
-
 static int http_dl_recv_resp(http_dl_info_t *info)
 {
     int nread, free_space;
@@ -1218,10 +1201,10 @@ static void http_dl_finish_req(http_dl_info_t *info)
 static int http_dl_list_proc_downloading()
 {
     http_dl_list_t *dl_list;
-    http_dl_info_t *info;
+    http_dl_info_t *info, *next_info;
     struct timeval tv;
     fd_set rset, rset_org;
-    int res, fd, read_res;
+    int res, read_res;
 
     dl_list = &http_dl_list_downloading;
     if (dl_list->count == 0) {
@@ -1258,26 +1241,18 @@ static int http_dl_list_proc_downloading()
         } else if (res < 0){
             /* 出错 */
             http_dl_log_error("select failed, return %d", res);
-            continue;
+            break;;
         }
 
-        /* 有数据到达 */
-        for (fd = 0; fd <= dl_list->maxfd && res > 0; fd++) {
-            if (!FD_ISSET(fd, &rset)) {
-                continue;
-            }
-
-            res--;
-            info = http_dl_find_info_by_sockfd(dl_list, fd);
-            if (info == NULL) {
-                http_dl_log_error("FATAL ERROR: sockfd %d not match any info entity", fd);
+        list_for_each_entry_safe(info, next_info, &dl_list->list, list, http_dl_info_t) {
+            if (!FD_ISSET(info->sockfd, &rset)) {
                 continue;
             }
 
             read_res = http_dl_recv_resp(info);
             if (read_res == -HTTP_DL_ERR_EOF) {
                 /* 该次下载结束 */
-                FD_CLR(fd, &rset_org);
+                FD_CLR(info->sockfd, &rset_org);
                 http_dl_del_info_from_download_list(info);
                 http_dl_finish_req(info);
                 continue;
@@ -1288,7 +1263,7 @@ static int http_dl_list_proc_downloading()
                 /* 下载，处理遇到问题 */
                 http_dl_log_error("receive data from %s, sockfd %d failed.",
                                         info->url, info->sockfd);
-                continue;
+                return -HTTP_DL_ERR_READ;
             }
         }
     }
