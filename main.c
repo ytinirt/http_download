@@ -1081,6 +1081,32 @@ static int http_dl_header_extract_long_num(const char *val, void *closure)
     return HTTP_DL_OK;
 }
 
+static int http_dl_header_dup_str_to_buf(const char *val, void *buf)
+{
+    int len;
+    char *val_end;
+
+    if (val == NULL || buf == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    val_end = strstr(val, "\r\n");
+    if (val_end == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    len = val_end - val;
+    if (len <= 0) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    bzero(buf, HTTP_DL_BUF_LEN);
+    memcpy(buf, val, MINVAL(len, HTTP_DL_BUF_LEN - 1));
+
+    return HTTP_DL_OK;
+}
+
+#if 0
 /* Strdup HEADER, and place the pointer to CLOSURE. XXX 记得释放堆空间buffer */
 static int http_dl_header_alloc_and_dup_str(const char *val, void *closure)
 {
@@ -1114,7 +1140,6 @@ static int http_dl_header_alloc_and_dup_str(const char *val, void *closure)
     return HTTP_DL_OK;
 }
 
-#if 0
 /* 如果是"none"，那么将*closure置1，否则置0 */
 static int http_dl_header_judge_str_none(const char *val, void *closure)
 {
@@ -1180,7 +1205,7 @@ static int http_dl_header_process(const char *header,
 static int http_dl_parse_header(http_dl_info_t *info)
 {
     int ret;
-    char *line_end, *header_val;
+    char *line_end;
     int hlen;
     char print_buf[HTTP_DL_BUF_LEN];
 
@@ -1196,6 +1221,7 @@ static int http_dl_parse_header(http_dl_info_t *info)
     *(info->buf_tail) = '\0';   /* 字符串操作时，确保不越界 */
 
     while (1) {
+        bzero(print_buf, HTTP_DL_BUF_LEN);
         line_end = strstr(info->buf_data, "\r\n");
         if (line_end == NULL) {
             /* header还没接收到完整的一行，继续... */
@@ -1218,63 +1244,53 @@ static int http_dl_parse_header(http_dl_info_t *info)
             goto header_line_done;
         }
 
-        header_val = NULL;
         ret = http_dl_header_process(info->buf_data,
                                      "Content-Type",
-                                     http_dl_header_alloc_and_dup_str,
-                                     &header_val);
+                                     http_dl_header_dup_str_to_buf,
+                                     print_buf);
         if (ret == HTTP_DL_OK || ret == -HTTP_DL_ERR_INVALID) {
-            if (header_val != NULL) {
-                http_dl_log_debug("Content-Type: %s", header_val);
-                http_dl_free(header_val);
-                header_val = NULL;
+            if (strlen(print_buf) > 0) {
+                http_dl_log_debug("Content-Type: %s", print_buf);
             }
             goto header_line_done;
         }
 
         ret = http_dl_header_process(info->buf_data,
                                      "Accept-Ranges",
-                                     http_dl_header_alloc_and_dup_str,
-                                     &header_val);
+                                     http_dl_header_dup_str_to_buf,
+                                     print_buf);
         if (ret == HTTP_DL_OK || ret == -HTTP_DL_ERR_INVALID) {
-            if (header_val != NULL) {
-                http_dl_log_debug("Content-Type: %s", header_val);
-                http_dl_free(header_val);
-                header_val = NULL;
+            if (strlen(print_buf) > 0) {
+                http_dl_log_debug("Accept-Ranges: %s", print_buf);
             }
             goto header_line_done;
         }
 
         ret = http_dl_header_process(info->buf_data,
                                      "Content-Range",
-                                     http_dl_header_alloc_and_dup_str,
-                                     &header_val);
+                                     http_dl_header_dup_str_to_buf,
+                                     print_buf);
         if (ret == HTTP_DL_OK || ret == -HTTP_DL_ERR_INVALID) {
-            if (header_val != NULL) {
-                http_dl_log_debug("Content-Type: %s", header_val);
-                http_dl_free(header_val);
-                header_val = NULL;
+            if (strlen(print_buf) > 0) {
+                http_dl_log_debug("Content-Range: %s", print_buf);
             }
             goto header_line_done;
         }
 
         ret = http_dl_header_process(info->buf_data,
                                      "Last-Modified",
-                                     http_dl_header_alloc_and_dup_str,
-                                     &header_val);
+                                     http_dl_header_dup_str_to_buf,
+                                     print_buf);
         if (ret == HTTP_DL_OK || ret == -HTTP_DL_ERR_INVALID) {
-            if (header_val != NULL) {
-                http_dl_log_debug("Content-Type: %s", header_val);
-                http_dl_free(header_val);
-                header_val = NULL;
+            if (strlen(print_buf) > 0) {
+                http_dl_log_debug("Last-Modified: %s", print_buf);
             }
             goto header_line_done;
         }
 
         hlen = line_end - info->buf_data;
         if (hlen > 0){
-            bzero(print_buf, sizeof(print_buf));
-            memcpy(print_buf, info->buf_data, MINVAL(hlen, (sizeof(print_buf) - 1)));
+            memcpy(print_buf, info->buf_data, MINVAL(hlen, (HTTP_DL_BUF_LEN - 1)));
             http_dl_log_debug("Unsupported header: %s", print_buf);
         }
 
@@ -1309,7 +1325,6 @@ static void http_dl_adjust_info_buf(http_dl_info_t *info)
 
     if (info->buf_data == info->buf_tail) {
         /* info->buf中数据已经处理完毕 */
-        http_dl_log_debug("Buffer data is all used up.");
         bzero(info->buf, HTTP_DL_READBUF_LEN);
         info->buf_data = info->buf;
         info->buf_tail = info->buf;
