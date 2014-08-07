@@ -12,7 +12,7 @@
 
 #include "http_download.h"
 
-int http_dl_log_level = 6;
+int http_dl_log_level = 7;
 
 static char *http_dl_agent_string = "Mozilla/5.0 (Windows NT 6.1; WOW64) " \
                                     "AppleWebKit/537.36 (KHTML, like Gecko) " \
@@ -115,202 +115,10 @@ static void *http_dl_xrealloc(void *obj, size_t size)
 }
 
 #if 0
-/* Read at most LEN bytes from FD, storing them to BUF.  This is
-   virtually the same as read(), but takes care of EINTR braindamage
-   and uses select() to timeout the stale connections (a connection is
-   stale if more than OPT.TIMEOUT time is spent in select() or
-   read()).  */
-static int http_dl_iread(int fd, char *buf, int len)
-{
-    int res;
 
-    if (buf == NULL || len <= 0) {
-        return -HTTP_DL_ERR_INVALID;
-    }
 
-    do {
-        res = read(fd, buf, len);
-    } while (res == -1 && errno == EINTR);
 
-    if (res > 0) {
-        return res;
-    } else if (res == 0) {
-        return -HTTP_DL_ERR_EOF;
-    } else {
-        return -HTTP_DL_ERR_READ;
-    }
-}
 
-/* Parse the HTTP status line, which is of format:
-
-   HTTP-Version SP Status-Code SP Reason-Phrase
-
-   The function returns the status-code, or -1 if the status line is
-   malformed.  The pointer to reason-phrase is returned in RP.  */
-static int http_dl_parse_status_line(const char *line)
-{
-    /* (the variables must not be named `major' and `minor', because
-     that breaks compilation with SunOS4 cc.)  */
-    int mjr, mnr, statcode;
-    const char *p;
-
-    if (line == NULL) {
-        return -HTTP_DL_ERR_INVALID;
-    }
-
-    /* The standard format of HTTP-Version is: `HTTP/X.Y', where X is
-     major version, and Y is minor version.  */
-    if (strncmp(line, "HTTP/", 5) != 0) {
-        return -HTTP_DL_ERR_INVALID;
-    }
-    line += 5;
-
-    /* Calculate major HTTP version.  */
-    p = line;
-    for (mjr = 0; isdigit(*line); line++) {
-        mjr = 10 * mjr + (*line - '0');
-    }
-    if (*line != '.' || p == line) {
-        return -HTTP_DL_ERR_INVALID;
-    }
-    ++line;
-
-    /* Calculate minor HTTP version.  */
-    p = line;
-    for (mnr = 0; isdigit(*line); line++) {
-        mnr = 10 * mnr + (*line - '0');
-    }
-    if (*line != ' ' || p == line) {
-        return -HTTP_DL_ERR_INVALID;
-    }
-    /* Wget will accept only 1.0 and higher HTTP-versions.  The value of
-     minor version can be safely ignored.  */
-    if (mjr < 1) {
-        return -HTTP_DL_ERR_INVALID;
-    }
-    ++line;
-
-    /* Calculate status code.  */
-    if (!(isdigit(*line) && isdigit(line[1]) && isdigit(line[2]))) {
-        return -HTTP_DL_ERR_INVALID;
-    }
-    statcode = 100 * (*line - '0') + 10 * (line[1] - '0') + (line[2] - '0');
-
-    /* Set up the reason phrase pointer.  */
-    line += 3;
-    /* RFC2068 requires SPC here, but we allow the string to finish
-     here, in case no reason-phrase is present.  */
-    if (*line != ' ') {
-        if (*line != '\0') {
-            http_dl_log_debug("reason: %s", line);
-        } else {
-            return -HTTP_DL_ERR_INVALID;
-        }
-    } else {
-        http_dl_log_debug("Reason: %s", line + 1);
-    }
-
-    return statcode;
-}
-
-/* Skip LWS (linear white space), if present.  Returns number of
-   characters to skip.  */
-static int http_dl_clac_lws(const char *string)
-{
-    const char *p = string;
-
-    if (string == NULL) {
-        return -HTTP_DL_ERR_INVALID;
-    }
-
-    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
-        ++p;
-    }
-
-    return (p - string);
-}
-
-/* Check whether HEADER begins with NAME and, if yes, skip the `:' and
-   the whitespace, and call PROCFUN with the arguments of HEADER's
-   contents (after the ':' and space) and ARG.  Otherwise, return 0.  */
-static int http_dl_header_process(const char *header,
-                                  const char *name,
-                                  int (*procfun)(const char *, void *),
-                                  void *arg)
-{
-    int gap;
-
-    /* Check whether HEADER matches NAME.  */
-    while (*name && (tolower(*name) == tolower(*header))) {
-        ++name, ++header;
-    }
-
-    if (*name || *header++ != ':') {
-        return 0;
-    }
-
-    gap = http_dl_clac_lws(header);
-    header += gap;
-
-    return ((*procfun)(header, arg));
-}
-
-static int http_dl_header_extract_number (const char *header, void *closure)
-{
-    const char *p = header;
-    long result;
-
-    for (result = 0; isdigit(*p); p++) {
-        result = 10 * result + (*p - '0');
-    }
-    if (*p != '\0') {
-        return 0;
-    }
-
-    *(long *)closure = result;
-
-    return 1;
-}
-
-/* Strdup HEADER, and place the pointer to CLOSURE. XXX 记得释放堆空间buffer */
-static int http_dl_header_dup_str(const char *header, void *closure)
-{
-    int len;
-    char *p = NULL;
-
-    len = strlen(header) + 1;
-    if (len == 1) {
-        http_dl_log_debug("header string is NULL");
-        return 0;
-    }
-
-    p = http_dl_xrealloc(p, len);
-    if (p == NULL) {
-        http_dl_log_debug("alloc failed");
-        return 0;
-    }
-    bzero(p, len);
-    strcpy(p, header);
-
-    *(char **)closure = p;
-
-    return 1;
-}
-
-/* Place 1 to ARG if the HDR contains the word "none", 0 otherwise.
-   Used for `Accept-Ranges'.  */
-static int http_dl_header_judge_none(const char *hdr, void *arg)
-{
-    int *where = (int *)arg;
-
-    if (strstr(hdr, "none")) {
-        *where = 1;
-    } else {
-        *where = 0;
-    }
-
-    return 1;
-}
 
 /* Parse the `Content-Range' header and extract the information it
    contains.  Returns 1 if successful, 0 otherwise.  */
@@ -1017,10 +825,14 @@ static void http_dl_list_debug(http_dl_list_t *list)
         if (info->recv_len == 0) {
             http_dl_print_raw("\t%s\n", info->url);
         } else if (info->elapsed_time == -1) {
-            http_dl_print_raw("\t%s [%ld KB]\n", info->local, info->recv_len >> 10);
+            http_dl_print_raw("\t%s [%ld KB / %ld KB]\n",
+                                info->local, info->recv_len >> 10, info->content_len >> 10);
         } else {
-            http_dl_print_raw("\t%s [%ld KB] [%ld KB/s]\n",
-                                info->local, info->recv_len >> 10, info->recv_len / info->elapsed_time);
+            http_dl_print_raw("\t%s [%ld KB / %ld KB] [%ld KB/s]\n",
+                                info->local,
+                                info->recv_len >> 10,
+                                info->content_len >> 10,
+                                info->recv_len / info->elapsed_time);
         }
     }
     http_dl_print_raw("--------------\n");
@@ -1139,26 +951,451 @@ static void http_dl_list_proc_initial()
     return;
 }
 
+static int http_dl_parse_status_line(http_dl_info_t *info)
+{
+    int reason_nbytes;
+    int mjr, mnr, statcode;
+    char *line_end, *p;
+
+    if (info == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    if (info->stage != HTTP_DL_STAGE_PARSE_STATUS_LINE) {
+        http_dl_log_debug("Wrong stage %d.", info->stage);
+        return -HTTP_DL_ERR_INTERNAL;
+    }
+
+    *(info->buf_tail) = '\0';   /* 字符串操作时，确保不越界 */
+
+    line_end = strstr(info->buf_data, "\r\n");
+    if (line_end == NULL) {
+        /* status line还没接收完整，继续... */
+        http_dl_log_debug("Incompleted status line: %s", info->buf_data);
+        return HTTP_DL_OK;
+    }
+
+    /* The standard format of HTTP-Version is: `HTTP/X.Y', where X is
+     major version, and Y is minor version.  */
+    if (strncmp(info->buf_data, "HTTP/", 5) != 0) {
+        http_dl_log_debug("Invalid status line: %s", info->buf_data);
+        return -HTTP_DL_ERR_INVALID;
+    }
+    info->buf_data += 5;
+
+    /* Calculate major HTTP version.  */
+    p = info->buf_data;
+    for (mjr = 0; isdigit(*p); p++) {
+        mjr = 10 * mjr + (*p - '0');
+    }
+    if (*p != '.' || p == info->buf_data) {
+        http_dl_log_debug("Invalid status line: %s", info->buf_data);
+        return -HTTP_DL_ERR_INVALID;
+    }
+    p++;
+    info->buf_data = p;
+
+    /* Calculate minor HTTP version.  */
+    for (mnr = 0; isdigit(*p); p++) {
+        mnr = 10 * mnr + (*p - '0');
+    }
+    if (*p != ' ' || p == info->buf_data) {
+        http_dl_log_debug("Invalid status line: %s", info->buf_data);
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    http_dl_log_debug("Version is HTTP/%d.%d", mjr, mnr);
+
+    p++;
+    info->buf_data = p;
+
+    /* Calculate status code.  */
+    if (!(isdigit(p[0]) && isdigit(p[1]) && isdigit(p[2]))) {
+        http_dl_log_debug("Invalid status line: %s", info->buf_data);
+        return -HTTP_DL_ERR_INVALID;
+    }
+    statcode = 100 * (p[0] - '0') + 10 * (p[1] - '0') + (p[2] - '0');
+    http_dl_log_debug("Status code is %d", statcode);
+
+    /* Set up the reason phrase pointer.  */
+    p += 3;
+    info->buf_data = p;
+    if (*p != ' ') {
+        http_dl_log_debug("Invalid status line: %s", info->buf_data);
+        return -HTTP_DL_ERR_INVALID;
+    }
+    info->buf_data++;
+    reason_nbytes = line_end - info->buf_data;
+    bzero(info->err_msg, sizeof(info->err_msg));
+    memcpy(info->err_msg, info->buf_data, MINVAL((sizeof(info->err_msg) - 1), reason_nbytes));
+    info->status_code = statcode;
+
+    http_dl_log_debug("Finish parse HTTP status line: %s", info->err_msg);
+
+    info->stage = HTTP_DL_STAGE_PARSE_HEADER;
+
+    info->buf_data = line_end + 2;  /* 略过"\r\n" */
+    if (info->buf_data < info->buf_tail) {
+        /* 还有数据未处理完，转到下一个stage，继续处理 */
+        return -HTTP_DL_ERR_AGAIN;
+    }
+
+    return HTTP_DL_OK;
+}
+
+/* Skip LWS (linear white space), if present.  Returns number of
+   characters to skip.  */
+static int http_dl_clac_lws(const char *string)
+{
+    const char *p = string;
+
+    if (string == NULL) {
+        return 0;
+    }
+
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+
+    return (p - string);
+}
+
+static int http_dl_header_extract_long_num(const char *val, void *closure)
+{
+    const char *p = val;
+    long result;
+
+    if (val == NULL || closure == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    for (result = 0; isdigit(*p); p++) {
+        result = 10 * result + (*p - '0');
+    }
+    if (*p != '\r') {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    *(long *)closure = result;
+
+    return HTTP_DL_OK;
+}
+
+/* Strdup HEADER, and place the pointer to CLOSURE. XXX 记得释放堆空间buffer */
+static int http_dl_header_alloc_and_dup_str(const char *val, void *closure)
+{
+    int len;
+    char *p, *val_end;
+
+    if (val == NULL || closure == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    val_end = strstr(val, "\r\n");
+    if (val_end == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    len = val_end - val;
+    if (len <= 0) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+    len++;
+
+    p = http_dl_xrealloc(NULL, len);
+    if (p == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+    bzero(p, len);
+    memcpy(p, val, len);
+
+    *(char **)closure = p;
+
+    return HTTP_DL_OK;
+}
+
+#if 0
+/* 如果是"none"，那么将*closure置1，否则置0 */
+static int http_dl_header_judge_str_none(const char *val, void *closure)
+{
+    char *val_end, *res;
+    int *where = (int *)closure;
+
+    if (val == NULL || closure == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    if ((val_end = strstr(val, "\r\n")) == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    res = strstr(val, "none");
+    if (res != NULL && res < val_end) {
+        *where = 1;
+    } else {
+        *where = 0;
+    }
+
+    return HTTP_DL_OK;
+}
+#endif
+
+/*
+ * 返回-HTTP_DL_ERR_INVALID表示解析错误，应直接跳过这一行;
+ * 返回-HTTP_DL_ERR_NOTFOUND表示name与当前行不匹配，继续下一行操作;
+ * 返回HTTP_DL_OK，表示当前行正常处理，可处理下一行了。
+ */
+static int http_dl_header_process(const char *header,
+                                  const char *name,
+                                  int (*procfun)(const char *, void *),
+                                  void *arg)
+{
+    const char *val;
+    int gap;
+
+    if (header == NULL
+        || name == NULL
+        || procfun == NULL
+        || arg == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    /* Check whether HEADER matches NAME.  */
+    while (*name && (tolower(*name) == tolower(*header))) {
+        ++name, ++header;
+    }
+
+    if (*name || *header++ != ':') {
+        return -HTTP_DL_ERR_NOTFOUND;
+    }
+
+    gap = http_dl_clac_lws(header);
+    val = header;
+    val += gap;
+
+    /* 返回HTTP_DL_OK或-HTTP_DL_ERR_INVALID */
+    return ((*procfun)(val, arg));
+}
+
+static int http_dl_parse_header(http_dl_info_t *info)
+{
+    int ret;
+    char *line_end, *header_val;
+    int hlen;
+    char print_buf[HTTP_DL_BUF_LEN];
+
+    if (info == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    if (info->stage != HTTP_DL_STAGE_PARSE_HEADER) {
+        http_dl_log_debug("Wrong stage %d.", info->stage);
+        return -HTTP_DL_ERR_INTERNAL;
+    }
+
+    *(info->buf_tail) = '\0';   /* 字符串操作时，确保不越界 */
+
+    while (1) {
+        line_end = strstr(info->buf_data, "\r\n");
+        if (line_end == NULL) {
+            /* header还没接收到完整的一行，继续... */
+            http_dl_log_debug("Incompleted header line: %s", info->buf_data);
+            break;
+        }
+
+        if (info->buf_data == line_end) {
+            /* header处理结束，修改stage为RECV_CONTENT，返回ERR_AGAIN，继续下阶段处理 */
+            info->stage = HTTP_DL_STAGE_RECV_CONTENT;
+            info->buf_data += 2;
+            return -HTTP_DL_ERR_AGAIN;
+        }
+
+        ret = http_dl_header_process(info->buf_data,
+                                     "Content-Length",
+                                     http_dl_header_extract_long_num,
+                                     &info->content_len);
+        if (ret == HTTP_DL_OK || ret == -HTTP_DL_ERR_INVALID) {
+            goto header_line_done;
+        }
+
+        header_val = NULL;
+        ret = http_dl_header_process(info->buf_data,
+                                     "Content-Type",
+                                     http_dl_header_alloc_and_dup_str,
+                                     &header_val);
+        if (ret == HTTP_DL_OK || ret == -HTTP_DL_ERR_INVALID) {
+            if (header_val != NULL) {
+                http_dl_log_debug("Content-Type: %s", header_val);
+                http_dl_free(header_val);
+                header_val = NULL;
+            }
+            goto header_line_done;
+        }
+
+        ret = http_dl_header_process(info->buf_data,
+                                     "Accept-Ranges",
+                                     http_dl_header_alloc_and_dup_str,
+                                     &header_val);
+        if (ret == HTTP_DL_OK || ret == -HTTP_DL_ERR_INVALID) {
+            if (header_val != NULL) {
+                http_dl_log_debug("Content-Type: %s", header_val);
+                http_dl_free(header_val);
+                header_val = NULL;
+            }
+            goto header_line_done;
+        }
+
+        ret = http_dl_header_process(info->buf_data,
+                                     "Content-Range",
+                                     http_dl_header_alloc_and_dup_str,
+                                     &header_val);
+        if (ret == HTTP_DL_OK || ret == -HTTP_DL_ERR_INVALID) {
+            if (header_val != NULL) {
+                http_dl_log_debug("Content-Type: %s", header_val);
+                http_dl_free(header_val);
+                header_val = NULL;
+            }
+            goto header_line_done;
+        }
+
+        ret = http_dl_header_process(info->buf_data,
+                                     "Last-Modified",
+                                     http_dl_header_alloc_and_dup_str,
+                                     &header_val);
+        if (ret == HTTP_DL_OK || ret == -HTTP_DL_ERR_INVALID) {
+            if (header_val != NULL) {
+                http_dl_log_debug("Content-Type: %s", header_val);
+                http_dl_free(header_val);
+                header_val = NULL;
+            }
+            goto header_line_done;
+        }
+
+        hlen = line_end - info->buf_data;
+        if (hlen > 0){
+            bzero(print_buf, sizeof(print_buf));
+            memcpy(print_buf, info->buf_data, MINVAL(hlen, (sizeof(print_buf) - 1)));
+            http_dl_log_debug("Unsupported header: %s", print_buf);
+        }
+
+header_line_done:
+        /* 对应解析完成或遇到错误 */
+        if (ret == -HTTP_DL_ERR_INVALID) {
+            http_dl_log_error("Invalid header line: %s", info->buf_data);
+        }
+        info->buf_data = line_end + 2;
+    }
+
+    return HTTP_DL_OK;
+}
+
+static inline void http_dl_move_data(char *dst, char *src, char *end)
+{
+    while (src < end) {
+        *dst = *src;
+        dst++;
+        src++;
+    }
+}
+
+static void http_dl_adjust_info_buf(http_dl_info_t *info)
+{
+    int data_len, free_space;
+
+    if (info == NULL) {
+        http_dl_log_debug("ERROR argument is NULL.");
+        return;
+    }
+
+    if (info->buf_data == info->buf_tail) {
+        /* info->buf中数据已经处理完毕 */
+        http_dl_log_debug("Buffer data is all used up.");
+        bzero(info->buf, HTTP_DL_READBUF_LEN);
+        info->buf_data = info->buf;
+        info->buf_tail = info->buf;
+        return;
+    }
+
+    data_len = info->buf_tail - info->buf_data;
+
+    free_space = info->buf + HTTP_DL_READBUF_LEN - info->buf_tail;
+    if (free_space < (HTTP_DL_READBUF_LEN >> 2)) {
+        http_dl_log_debug("buf_tail<%p> reaching buffer end<%p>, adjust buffer...",
+                            info->buf_tail, info->buf + HTTP_DL_READBUF_LEN);
+        http_dl_move_data(info->buf, info->buf_data, info->buf_tail);
+        info->buf_data = info->buf;
+        info->buf_tail = info->buf_data + data_len;
+
+        return;
+    } else if ((free_space < (HTTP_DL_READBUF_LEN >> 1))
+                && (data_len < (HTTP_DL_READBUF_LEN >> 2))) {
+        http_dl_log_debug("free space [%d], and data length [%d], adjust buffer...",
+                            free_space, data_len);
+        http_dl_move_data(info->buf, info->buf_data, info->buf_tail);
+        info->buf_data = info->buf;
+        info->buf_tail = info->buf_data + data_len;
+
+        return;
+    } else {
+        http_dl_log_debug("no adjustment, free[%d], data[%d], buf<%p>, tail<%p>",
+                            free_space, data_len, info->buf, info->buf_tail);
+
+        return;
+    }
+}
+
+static int http_dl_recv_content(http_dl_info_t *info)
+{
+    int data_len;
+
+    if (info == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    if (info->stage != HTTP_DL_STAGE_RECV_CONTENT) {
+        http_dl_log_debug("Wrong stage %d.", info->stage);
+        return -HTTP_DL_ERR_INTERNAL;
+    }
+
+    if (info->buf_data == info->buf_tail) {
+        http_dl_log_debug("No data in buffer.");
+        return HTTP_DL_OK;
+    }
+
+    data_len = info->buf_tail - info->buf_data;
+    info->recv_len += data_len;
+    /* XXX TODO: 保存接收到数据到文件中 */
+    info->buf_data += data_len;
+
+    return HTTP_DL_OK;
+}
+
+/*
+ * 接收HTTP服务器响应的主函数
+ */
 static int http_dl_recv_resp(http_dl_info_t *info)
 {
+    int ret;
     int nread, free_space;
 
     if (info == NULL) {
         return -HTTP_DL_ERR_INVALID;
     }
 
-    if (info->stage < HTTP_DL_STAGE_RECV_CONTENT) {
-        info->stage = HTTP_DL_STAGE_RECV_CONTENT;
+    if (info->stage <= HTTP_DL_STAGE_SEND_REQUEST) {
+        /* 赋予接收报数据的初始状态 */
+        info->stage = HTTP_DL_STAGE_PARSE_STATUS_LINE;
     }
 
     free_space = info->buf + HTTP_DL_READBUF_LEN - info->buf_tail;
-    if (free_space < (HTTP_DL_READBUF_LEN >> 2)) {
-        http_dl_log_debug("WARNING: info buffer free space %d too small", free_space);
+    if (free_space < (HTTP_DL_READBUF_LEN >> 1)) {
+        http_dl_log_info("WARNING: info buffer free space %d too small, (total %d)",
+                            free_space, HTTP_DL_READBUF_LEN);
     }
 
     nread = read(info->sockfd, info->buf_tail, free_space);
     if (nread == 0) {
-        /* XXX: 下载结束，需要把info buffer里面的数据全部flush到文件中 */
+        /* XXX TODO: 下载结束，需要把info buffer里面的数据全部flush到文件中 */
         return -HTTP_DL_ERR_EOF;
     } else if (nread < 0) {
         http_dl_log_error("read failed, %d", nread);
@@ -1166,12 +1403,38 @@ static int http_dl_recv_resp(http_dl_info_t *info)
     }
 
     info->buf_tail += nread;
-    info->recv_len += nread;
 
-    /* XXX TODO: 从这里开始处理网络读数据 */
-    info->buf_tail = info->buf;
+again:
+    switch (info->stage) {
+    case HTTP_DL_STAGE_PARSE_STATUS_LINE:
+        ret = http_dl_parse_status_line(info);
+        break;
+    case HTTP_DL_STAGE_PARSE_HEADER:
+        ret = http_dl_parse_header(info);
+        break;
+    case HTTP_DL_STAGE_RECV_CONTENT:
+        ret = http_dl_recv_content(info);
+        break;
+    default:
+        http_dl_log_error("Incorrect stage %d in here.", info->stage);
+        return -HTTP_DL_ERR_INTERNAL;
+        break;
+    }
 
-    return HTTP_DL_OK;
+    if (ret == -HTTP_DL_ERR_AGAIN) {
+        /* buffer中还有下个stage的数据未处理完 */
+        http_dl_log_debug("Continue next stage process.");
+        goto again;
+    } else if (ret == HTTP_DL_OK) {
+        /* 现阶段还未处理完，等待下次到来的数据，继续处理 */
+        /* XXX: 调整buffer中此次未处理完的数据 */
+        (void)http_dl_adjust_info_buf(info);
+    } else {
+        http_dl_log_debug("Process response failed %d.", ret);
+        /* XXX TODO: 需要flush buffer中的数据么? */
+    }
+
+    return ret;
 }
 
 static void http_dl_finish_req(http_dl_info_t *info)

@@ -53,6 +53,10 @@ typedef struct http_dl_info_s {
     int filefd;
 
     char buf[HTTP_DL_READBUF_LEN];
+    void *dont_touch;               /* 由于buf_tail指向buf中下一个空闲位置，
+                                     * 当buf用满时，buf_tail便超出buf，指向dont_touch，
+                                     * 因此，dont_touch起到缓冲带作用，无实际意义.
+                                     */
     char *buf_data;
     char *buf_tail;
 
@@ -91,6 +95,8 @@ typedef enum http_dl_err_e {
     HTTP_DL_ERR_READ,
     HTTP_DL_ERR_EOF,
     HTTP_DL_ERR_RESOURCE,
+    HTTP_DL_ERR_AGAIN,
+    HTTP_DL_ERR_NOTFOUND,
 } http_dl_err_t;
 
 #define HTTP_URL_PREFIX    "http://"
