@@ -197,6 +197,9 @@ static unsigned long http_dl_calc_elapsed(http_dl_info_t *di)
     gettimeofday(&t, NULL);
     ret = (t.tv_sec - di->start_time.tv_sec) * 1000
            + (t.tv_usec - di->start_time.tv_usec) / 1000;
+    if (ret == 0) {
+        ret = 100;  /* 如果计算不到delta time，那么强制设为100ms，方便计算速度 */
+    }
     di->elapsed_time = ret;
 
     return ret;
@@ -825,13 +828,13 @@ static void http_dl_list_debug(http_dl_list_t *list)
         if (info->recv_len == 0) {
             http_dl_print_raw("\t%s\n", info->url);
         } else if (info->elapsed_time == -1) {
-            http_dl_print_raw("\t%s [%ld KB / %ld KB]\n",
-                                info->local, info->recv_len >> 10, info->content_len >> 10);
+            http_dl_print_raw("\t%s [%ld B/%ld B]\n",
+                                info->local, info->recv_len, info->content_len);
         } else {
-            http_dl_print_raw("\t%s [%ld KB / %ld KB] [%ld KB/s]\n",
+            http_dl_print_raw("\t%s [%ld B/%ld B] [%ld KB/s]\n",
                                 info->local,
-                                info->recv_len >> 10,
-                                info->content_len >> 10,
+                                info->recv_len,
+                                info->content_len,
                                 info->recv_len / info->elapsed_time);
         }
     }
@@ -915,7 +918,6 @@ static int http_dl_send_req(http_dl_info_t *di)
     }
 
     http_dl_log_info("HTTP request sent, awaiting response...");
-    http_dl_reset_time(di);
     ret = HTTP_DL_OK;
 
 err_out:
@@ -1231,6 +1233,7 @@ static int http_dl_parse_header(http_dl_info_t *info)
 
         if (info->buf_data == line_end) {
             /* header处理结束，修改stage为RECV_CONTENT，返回ERR_AGAIN，继续下阶段处理 */
+            http_dl_reset_time(info);
             info->stage = HTTP_DL_STAGE_RECV_CONTENT;
             info->buf_data += 2;
             return -HTTP_DL_ERR_AGAIN;
