@@ -9,6 +9,8 @@
 #include <sys/time.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include "http_download.h"
 
@@ -94,6 +96,30 @@ static int http_dl_iwrite(int fd, char *buf, int len)
     return len;
 }
 
+static int http_dl_write(int fd, char *buf, int len)
+{
+    int res = 0, already_write = 0;
+
+    if (fd < 0 || buf == NULL || len <= 0) {
+        return already_write;
+    }
+
+    while (len > 0) {
+        do {
+            res = write(fd, buf, len);
+            if (res > 0) {
+                already_write += res;
+            }
+        } while (res == -1 && errno == EINTR);
+        if (res <= 0) {
+            return already_write;
+        }
+        buf += res;
+        len -= res;
+    }
+    return already_write;
+}
+
 static void *http_dl_xrealloc(void *obj, size_t size)
 {
     void *res;
@@ -113,61 +139,6 @@ static void *http_dl_xrealloc(void *obj, size_t size)
 
     return res;
 }
-
-#if 0
-/* Parse the `Content-Range' header and extract the information it
-   contains.  Returns 1 if successful, 0 otherwise.  */
-static int http_dl_header_parse_range(const char *hdr, void *arg)
-{
-    http_dl_range_t *closure = (http_dl_range_t *)arg;
-    long num;
-
-    /* Certain versions of Nutscape proxy server send out
-    `Content-Length' without "bytes" specifier, which is a breach of
-    RFC2068 (as well as the HTTP/1.1 draft which was current at the
-    time).  But hell, I must support it...  */
-    if (strncasecmp(hdr, "bytes", 5) == 0) {
-        hdr += 5;
-        hdr += http_dl_clac_lws(hdr);
-        if (!*hdr) {
-            return 0;
-        }
-    }
-
-    if (!isdigit(*hdr)) {
-        return 0;
-    }
-
-    for (num = 0; isdigit(*hdr); hdr++) {
-        num = 10 * num + (*hdr - '0');
-    }
-
-    if (*hdr != '-' || !isdigit(*(hdr + 1))) {
-        return 0;
-    }
-
-    closure->first_byte_pos = num;
-    ++hdr;
-
-    for (num = 0; isdigit(*hdr); hdr++) {
-        num = 10 * num + (*hdr - '0');
-    }
-
-    if (*hdr != '/' || !isdigit(*(hdr + 1))) {
-        return 0;
-    }
-
-    closure->last_byte_pos = num;
-    ++hdr;
-
-    for (num = 0; isdigit(*hdr); hdr++) {
-        num = 10 * num + (*hdr - '0');
-    }
-
-    closure->entity_length = num;
-    return 1;
-}
-#endif
 
 static void http_dl_reset_time(http_dl_info_t *di)
 {
@@ -198,6 +169,45 @@ static unsigned long http_dl_calc_elapsed(http_dl_info_t *di)
     di->elapsed_time = ret;
 
     return ret;
+}
+
+static int http_dl_init_filefd(http_dl_info_t *info)
+{
+    int fd = -1, ret, restart_len;
+    struct stat file_stat;
+
+    if (info == NULL) {
+        http_dl_log_debug("Invalid input, info == NULL");
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    bzero(&file_stat, sizeof(file_stat));
+    ret = stat(info->local, &file_stat);
+
+    if ((ret == 0) && (S_ISREG(file_stat.st_mode))) {
+        /* File already exist, and it is regular file. */
+        http_dl_log_debug("File %s is exist, and is regular file.", info->local);
+        restart_len = file_stat.st_size;
+        fd = open(info->local, O_RDWR | O_APPEND);
+    } else  {
+        http_dl_log_debug("%s status fail or non-regular file, create it.", info->local);
+        restart_len = 0;
+        fd = creat(info->local, 0644);
+    }
+
+    if (fd < 0) {
+        http_dl_log_debug("Open or create %s failed.", info->local);
+        return -HTTP_DL_ERR_FOPEN;
+    }
+
+    info->filefd = fd;
+    info->restart_len = restart_len;
+    info->flags |= HTTP_DL_F_RESTART_FILE;
+
+    http_dl_log_debug("Open file %s success, fd[%d], restart_len[%ld].",
+                        info->local, info->filefd, info->restart_len);
+
+    return HTTP_DL_OK;
 }
 
 static http_dl_info_t *http_dl_create_info(char *url)
@@ -294,15 +304,23 @@ static http_dl_info_t *http_dl_create_info(char *url)
 
     di->recv_len = 0;
     di->content_len = 0;
-    di->restart_len = 0;
+    di->total_len = 0;
     di->status_code = HTTP_DL_OK;
     di->sockfd = -1;
-    di->filefd = -1;
+    if (http_dl_init_filefd(di) != HTTP_DL_OK) {
+        http_dl_log_error("Initialize file fd failed: %s.", di->local);
+        goto err_out;
+    }
 
     di->buf_data = di->buf;
     di->buf_tail = di->buf;
 
     return di;
+
+err_out:
+    http_dl_free(di);
+
+    return NULL;
 }
 
 static void http_dl_add_info_to_list(http_dl_info_t *info, http_dl_list_t *list)
@@ -409,13 +427,16 @@ static void http_dl_list_debug(http_dl_list_t *list)
         if (info->recv_len == 0) {
             http_dl_print_raw("\t%s\n", info->url);
         } else if (info->elapsed_time == -1) {
-            http_dl_print_raw("\t%s [%ld B/%ld B]\n",
-                                info->local, info->recv_len, info->content_len);
+            http_dl_print_raw("\t%s [%ld B/%ld B], restart[%ld B], total[%ld B]\n",
+                                info->local, info->recv_len, info->content_len,
+                                info->restart_len, info->total_len);
         } else {
-            http_dl_print_raw("\t%s [%ld B/%ld B] [%ld KB/s]\n",
+            http_dl_print_raw("\t%s [%ld B/%ld B], restart[%ld B], total[%ld B] [%ld KB/s]\n",
                                 info->local,
                                 info->recv_len,
                                 info->content_len,
+                                info->restart_len,
+                                info->total_len,
                                 info->recv_len / info->elapsed_time);
         }
     }
@@ -689,6 +710,65 @@ static int http_dl_header_dup_str_to_buf(const char *val, void *buf)
     return HTTP_DL_OK;
 }
 
+/*
+ * Content-Range: bytes 1113952-1296411/9570351
+ * Content-Range: bytes 0-12903171/12903172
+ */
+static int http_dl_header_parse_range(const char *hdr, void *arg)
+{
+    http_dl_range_t *closure = (http_dl_range_t *)arg;
+    long num;
+
+    if (closure == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    /* Certain versions of Nutscape proxy server send out
+    `Content-Length' without "bytes" specifier, which is a breach of
+    RFC2068 (as well as the HTTP/1.1 draft which was current at the
+    time).  But hell, I must support it...  */
+    if (strncasecmp(hdr, "bytes", 5) == 0) {
+        hdr += 5;
+        hdr += http_dl_clac_lws(hdr);
+        if (!*hdr) {
+            return -HTTP_DL_ERR_INVALID;
+        }
+    }
+
+    if (!isdigit(*hdr)) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    for (num = 0; isdigit(*hdr); hdr++) {
+        num = 10 * num + (*hdr - '0');
+    }
+
+    if (*hdr != '-' || !isdigit(*(hdr + 1))) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    closure->first_byte_pos = num;
+    ++hdr;
+
+    for (num = 0; isdigit(*hdr); hdr++) {
+        num = 10 * num + (*hdr - '0');
+    }
+
+    if (*hdr != '/' || !isdigit(*(hdr + 1))) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    closure->last_byte_pos = num;
+    ++hdr;
+
+    for (num = 0; isdigit(*hdr); hdr++) {
+        num = 10 * num + (*hdr - '0');
+    }
+
+    closure->entity_length = num;
+    return HTTP_DL_OK;
+}
+
 #if 0
 /* Strdup HEADER, and place the pointer to CLOSURE. XXX 记得释放堆空间buffer */
 static int http_dl_header_alloc_and_dup_str(const char *val, void *closure)
@@ -791,6 +871,7 @@ static int http_dl_parse_header(http_dl_info_t *info)
     char *line_end;
     int hlen;
     char print_buf[HTTP_DL_BUF_LEN];
+    http_dl_range_t range;
 
     if (info == NULL) {
         return -HTTP_DL_ERR_INVALID;
@@ -825,6 +906,10 @@ static int http_dl_parse_header(http_dl_info_t *info)
                                      http_dl_header_extract_long_num,
                                      &info->content_len);
         if (ret == HTTP_DL_OK || ret == -HTTP_DL_ERR_INVALID) {
+            if (info->restart_len == 0 && info->total_len == 0) {
+                /* 非断点续传时，total_len等于content_len */
+                info->total_len = info->content_len;
+            }
             goto header_line_done;
         }
 
@@ -850,14 +935,35 @@ static int http_dl_parse_header(http_dl_info_t *info)
             goto header_line_done;
         }
 
+        bzero(&range, sizeof(range));
         ret = http_dl_header_process(info->buf_data,
                                      "Content-Range",
-                                     http_dl_header_dup_str_to_buf,
-                                     print_buf);
-        if (ret == HTTP_DL_OK || ret == -HTTP_DL_ERR_INVALID) {
-            if (strlen(print_buf) > 0) {
-                http_dl_log_debug("Content-Range: %s", print_buf);
+                                     http_dl_header_parse_range,
+                                     &range);
+        if (ret == HTTP_DL_OK) {
+            /* 解析range成功，检查范围，并更新所有xxx_len */
+            if (info->restart_len != range.first_byte_pos) {
+                /* XXX TODO: 如何继续??? */
+                http_dl_log_error("File %s restart<%ld>, but range<%ld-%ld/%ld>",
+                                    info->local,
+                                    info->restart_len,
+                                    range.first_byte_pos,
+                                    range.last_byte_pos,
+                                    range.entity_length);
+            } else {
+                info->total_len = range.entity_length;
             }
+            http_dl_log_debug("File %s restart<%ld>, but range<%ld-%ld/%ld>",
+                                info->local,
+                                info->restart_len,
+                                range.first_byte_pos,
+                                range.last_byte_pos,
+                                range.entity_length);
+            goto header_line_done;
+        } else if (ret == -HTTP_DL_ERR_INVALID) {
+            /* 解析range失败 */
+            /* XXX TODO */
+            http_dl_log_error("Parse range failed: %s.", info->local);
             goto header_line_done;
         }
 
@@ -943,9 +1049,69 @@ static void http_dl_adjust_info_buf(http_dl_info_t *info)
     }
 }
 
+static int http_dl_flush_buf_data(http_dl_info_t *info)
+{
+    int data_len, ret;
+
+    if (info == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    if (info->stage != HTTP_DL_STAGE_RECV_CONTENT) {
+        http_dl_log_debug("flush buf data to file only permitted in HTTP_DL_STAGE_RECV_CONTENT.");
+        info->buf_data = info->buf;
+        info->buf_tail = info->buf;
+        return HTTP_DL_OK;
+    }
+
+    data_len = info->buf_tail - info->buf_data;
+    if (data_len == 0) {
+        /* 数据为空 */
+        info->buf_data = info->buf;
+        info->buf_tail = info->buf;
+        return HTTP_DL_OK;
+    } else if (data_len < 0) {
+        http_dl_log_error("FATAL error, buf_tail<%p> is before buf_data<%p>, diff %d.",
+                            info->buf_tail, info->buf_data, data_len);
+        info->buf_tail = info->buf_data;
+        return -HTTP_DL_ERR_INTERNAL;
+    }
+
+    ret = http_dl_write(info->filefd, info->buf_data, data_len);
+    info->recv_len += ret;
+    if (ret < data_len) {
+        /* 未写完 */
+        info->buf_data += ret;
+        return -HTTP_DL_ERR_WRITE;
+    }
+
+    /* 所有数据都写完了 */
+    info->buf_data = info->buf;
+    info->buf_tail = info->buf;
+
+    return HTTP_DL_OK;
+}
+
+static int http_dl_sync_file_data(http_dl_info_t *info)
+{
+    int ret;
+
+    if (info == NULL) {
+        return -HTTP_DL_ERR_INVALID;
+    }
+
+    ret = fsync(info->filefd);
+
+    if (ret < 0) {
+        return -HTTP_DL_ERR_FSYNC;
+    } else {
+        return HTTP_DL_OK;
+    }
+}
+
 static int http_dl_recv_content(http_dl_info_t *info)
 {
-    int data_len;
+    int ret;
 
     if (info == NULL) {
         return -HTTP_DL_ERR_INVALID;
@@ -961,10 +1127,12 @@ static int http_dl_recv_content(http_dl_info_t *info)
         return HTTP_DL_OK;
     }
 
-    data_len = info->buf_tail - info->buf_data;
-    info->recv_len += data_len;
-    /* XXX TODO: 保存接收到数据到文件中 */
-    info->buf_data += data_len;
+    ret = http_dl_flush_buf_data(info);
+    if (ret != HTTP_DL_OK) {
+        /* XXX TODO: 单个下载任务失败后，关闭它，不影响其它下载任务 */
+        http_dl_log_debug("Flush buffer data to file failed, %s.", info->local);
+        http_dl_sync_file_data(info);   /* XXX TODO: 这里需要么??? */
+    }
 
     return HTTP_DL_OK;
 }
@@ -994,7 +1162,13 @@ static int http_dl_recv_resp(http_dl_info_t *info)
 
     nread = read(info->sockfd, info->buf_tail, free_space);
     if (nread == 0) {
-        /* XXX TODO: 下载结束，需要把info buffer里面的数据全部flush到文件中 */
+        /* XXX: 下载结束，需要把info buffer里面的数据全部flush到文件中，并同步sync文件 */
+        if (http_dl_flush_buf_data(info) != HTTP_DL_OK) {
+            http_dl_log_debug("Flush buffer data to %s failed.", info->local);
+        }
+        if (http_dl_sync_file_data(info) != HTTP_DL_OK) {
+            http_dl_log_debug("Sync file %s failed.", info->local);
+        }
         return -HTTP_DL_ERR_EOF;
     } else if (nread < 0) {
         http_dl_log_error("read failed, %d", nread);
@@ -1067,6 +1241,7 @@ static int http_dl_list_proc_downloading()
     struct timeval tv;
     fd_set rset, rset_org;
     int res, read_res;
+    int ntimes = 0;
 
     dl_list = &http_dl_list_downloading;
     if (dl_list->count == 0) {
@@ -1094,7 +1269,12 @@ static int http_dl_list_proc_downloading()
         res = select(dl_list->maxfd + 1, &rset, NULL, NULL, &tv);
         if (res == 0) {
             /* 超时 */
-            http_dl_log_debug("select timeout (%d secs)", HTTP_DL_READ_TIMEOUT);
+            ntimes++;
+            http_dl_log_debug("[%d] select timeout (%d secs)", ntimes, HTTP_DL_READ_TIMEOUT);
+            if (ntimes > HTTP_DL_TIMEOUT_RETRIES) {
+                http_dl_log_error("select timeout...");
+                break;
+            }
             continue;
         } else if (res == -1 && errno == EINTR) {
             /* 被中断 */
@@ -1105,6 +1285,7 @@ static int http_dl_list_proc_downloading()
             http_dl_log_error("select failed, return %d", res);
             break;
         }
+        ntimes = 0; /* 重置超时次数记录 */
 
         list_for_each_entry_safe(info, next_info, &dl_list->list, list, http_dl_info_t) {
             if (!FD_ISSET(info->sockfd, &rset)) {

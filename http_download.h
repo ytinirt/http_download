@@ -12,6 +12,7 @@
 #define HTTP_DL_READBUF_LEN     4096
 
 #define HTTP_DL_READ_TIMEOUT    10  /* 单位秒 */
+#define HTTP_DL_TIMEOUT_RETRIES 3   /* select连续3次超时后，结束 */
 
 typedef int bool;
 #define true 1
@@ -36,6 +37,7 @@ typedef enum http_dl_stage_e {
 } http_dl_stage_t;
 
 #define HTTP_DL_F_GENUINE_AGENT 0x00000001UL
+#define HTTP_DL_F_RESTART_FILE  0x00000002UL
 
 typedef struct http_dl_info_s {
     http_dl_stage_t stage;
@@ -60,9 +62,10 @@ typedef struct http_dl_info_s {
     char *buf_data;
     char *buf_tail;
 
-    long recv_len;                  /* received length */
-    long content_len;               /* this HTTP session expected length */
-    long restart_len;               /* the restart value, for range */
+    long recv_len;                  /* 接收并成功write到file中的数据长度 */
+    long content_len;               /* 当次http会话传送的数据长度，注意与total_len区别 */
+    long restart_len;               /* 断点续传中，开始接收的位置，目前仅支持range形式 */
+    long total_len;                 /* 下载文件的真实长度 */
     int status_code;
 
     char err_msg[HTTP_DL_BUF_LEN];
@@ -91,6 +94,7 @@ typedef enum http_dl_err_e {
     HTTP_DL_ERR_SOCK,
     HTTP_DL_ERR_CONN,
     HTTP_DL_ERR_FOPEN,
+    HTTP_DL_ERR_FSYNC,
     HTTP_DL_ERR_WRITE,
     HTTP_DL_ERR_READ,
     HTTP_DL_ERR_EOF,
